@@ -1,0 +1,4 @@
+sudo apt-get install fswebcam  # 安装 [6,7](@ref)
+fswebcam -d /dev/video0 -r 1280x1024 --no-banner image1.jpg  # 拍照 [6,7](@ref)
+
+限制图像分辨率（推荐640×480）

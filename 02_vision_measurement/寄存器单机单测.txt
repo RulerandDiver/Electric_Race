@@ -1,0 +1,2286 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+整合测量系统
+集成A4纸检测、距离测量、形状检测与测量功能
+触摸屏友好界面，一键测量D和x参数
+"""
+
+import os
+# 设置显示环境变量以避免Qt平台插件问题
+os.environ['QT_QPA_PLATFORM'] = 'xcb'
+
+import cv2
+import numpy as np
+import math
+import json
+import sys
+import serial
+import time
+import re
+import threading
+import queue
+from datetime import datetime
+from typing import Dict, List, Tuple, Optional
+
+class IntegratedMeasurementSystem:
+    """整合测量系统 - A4纸距离D + 几何形状参数x"""
+    
+    def __init__(self, camera_width=1280, camera_height=720, 
+                 calibration_data_path="Calibration/p3/calibration_data.json",
+                 serial_port='/dev/ttyUSB0', serial_baudrate=9600):
+        # 摄像头设置
+        self.camera_width = camera_width
+        self.camera_height = camera_height
+        
+        # A4纸参数
+        self.a4_width_mm = 210.0
+        self.a4_height_mm = 297.0
+        self.a4_real_height = 0.297  # A4纸实际高度(米)
+        
+        # 串口通信设置
+        self.serial_port = serial_port
+        self.serial_baudrate = serial_baudrate
+        self.serial_conn = None
+        self.serial_thread = None
+        self.serial_running = False
+        self.current_data_queue = queue.Queue(maxsize=100)
+        self.current_value = 0.0
+        self.last_current_update = None
+        self.current_update_interval = 0.5  # 0.5秒刷新一次
+        
+        # 功耗计算相关参数
+        self.voltage_us = 5.0  # 固定电压5V
+        self.current_power = 0.0  # 当前功耗P
+        self.max_power = 0.0  # 最大功耗Pmax，初始值为0
+        
+        # 加载相机标定数据
+        self.calibration_data = self.load_calibration_data(calibration_data_path)
+        self.camera_matrix = None
+        self.distortion_coeffs = None
+        self.focal_length_x = None
+        self.focal_length_y = None
+        self.principal_point = None
+        
+        if self.calibration_data:
+            self.extract_camera_parameters()
+        else:
+            # 使用估算参数（基于1280x720分辨率）
+            self.focal_length_x = 1200
+            self.focal_length_y = 1200
+            self.principal_point = (640, 360)
+        
+        # 黑色检测参数 - 继承自step1
+        self.hsv_black_lower = np.array([0, 0, 0])
+        self.hsv_black_upper = np.array([180, 255, 80])
+        self.min_black_area = 5000
+        self.max_black_area = 100000
+        self.min_inner_area = 10000
+        self.max_inner_area = 300000
+        self.inner_outer_ratio_min = 0.3
+        self.inner_outer_ratio_max = 0.8
+        
+        # 形状检测参数 - 继承自shape_detection_measurement
+        self.binary_threshold = 100
+        self.min_contour_area = 1000
+        self.max_contour_area = 20000000
+        self.circularity_threshold = 0.8
+        self.approx_epsilon_factor = 0.03
+        self.square_aspect_ratio_tolerance = 0.2
+        
+        # 透视变换参数
+        self.output_width = 2100   # 对应210mm
+        self.output_height = 2970  # 对应297mm
+        self.pixel_to_mm_ratio = 0.1  # 毫米/像素
+        
+        # 距离滤波参数 - 继承自step2
+        self.distance_history = []
+        self.history_size = 5
+        
+        # Interface state
+        self.measuring = False
+        self.last_d = None
+        self.last_x = None
+        self.measurement_complete = False
+        self.last_target = None
+        self.last_shape_info = None
+        
+        # Button area (bottom of screen)
+        self.button_height = 80
+        self.button_margin = 20
+    
+    def load_calibration_data(self, file_path: str) -> Optional[Dict]:
+        """加载相机标定数据 - 继承自step2"""
+        if not os.path.exists(file_path):
+            print(f"Warning: Calibration data file not found {file_path}")
+            print("Will use estimated camera parameters, accuracy may be lower")
+            return None
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            print(f"Successfully loaded camera calibration data: {file_path}")
+            return data
+        except Exception as e:
+            print(f"Failed to load calibration data: {e}")
+            return None
+    
+    def extract_camera_parameters(self):
+        """提取相机参数 - 继承自step2"""
+        if not self.calibration_data:
+            return
+        
+        try:
+            # 从标定数据中提取参数
+            camera_matrix = np.array(self.calibration_data['camera_matrix'])
+            self.camera_matrix = camera_matrix
+            self.distortion_coeffs = np.array(self.calibration_data['distortion_coefficients'])
+            
+            self.focal_length_x = camera_matrix[0, 0]
+            self.focal_length_y = camera_matrix[1, 1]
+            self.principal_point = (camera_matrix[0, 2], camera_matrix[1, 2])
+            
+            print(f"Camera parameters loaded:")
+            print(f"  Focal length: fx={self.focal_length_x:.2f}, fy={self.focal_length_y:.2f}")
+            print(f"  Principal point: cx={self.principal_point[0]:.2f}, cy={self.principal_point[1]:.2f}")
+            
+        except Exception as e:
+            print(f"Failed to extract camera parameters: {e}")
+            # 使用估算参数
+            self.focal_length_x = 1200
+            self.focal_length_y = 1200
+            self.principal_point = (640, 360)
+    
+    def detect_field_lines(self, black_mask):
+        """检测场地黑线（轴线和基准线），用于后续过滤干扰"""
+        # 检测直线轮廓
+        contours, _ = cv2.findContours(black_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        field_line_contours = []
+        
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            # 跳过过小的轮廓
+            if area < 1000:
+                continue
+                
+            # 获取边界框
+            x, y, w, h = cv2.boundingRect(contour)
+            
+            # 计算长宽比
+            aspect_ratio = max(w, h) / min(w, h) if min(w, h) > 0 else 0
+            
+            # 检测细长的形状（场地黑线特征）
+            # 轴线和基准线应该是细长的矩形
+            if aspect_ratio > 10:  # 长宽比大于10:1的细长形状
+                # 进一步验证是否为直线
+                # 使用轮廓近似
+                epsilon = 0.02 * cv2.arcLength(contour, True)
+                approx = cv2.approxPolyDP(contour, epsilon, True)
+                
+                # 检查轮廓的线性特征
+                # 计算轮廓的拟合直线
+                [vx, vy, x0, y0] = cv2.fitLine(contour, cv2.DIST_L2, 0, 0.01, 0.01)
+                
+                # 计算轮廓点到拟合直线的平均距离
+                points = contour.reshape(-1, 2)
+                line_distances = []
+                
+                for point in points:
+                    px, py = point
+                    # 点到直线的距离公式
+                    distance = abs((py - y0) * vx - (px - x0) * vy) / np.sqrt(vx*vx + vy*vy)
+                    line_distances.append(distance)
+                
+                avg_distance = np.mean(line_distances)
+                
+                # 如果平均距离小于阈值，认为是直线
+                if avg_distance < 5:  # 5像素的容差
+                    field_line_contours.append({
+                        'contour': contour,
+                        'bbox': (x, y, w, h),
+                        'aspect_ratio': aspect_ratio,
+                        'area': area,
+                        'avg_line_distance': avg_distance,
+                        'line_params': (vx, vy, x0, y0)
+                    })
+        
+        return field_line_contours
+    
+    def create_field_line_mask(self, image_shape, field_lines):
+        """创建场地黑线的掩码，用于从黑色区域中移除这些干扰"""
+        mask = np.zeros(image_shape[:2], dtype=np.uint8)
+        
+        for line_info in field_lines:
+            # 在掩码上绘制场地黑线轮廓
+            cv2.fillPoly(mask, [line_info['contour']], 255)
+            
+            # 为了更好地移除干扰，稍微扩展轮廓边界
+            x, y, w, h = line_info['bbox']
+            # 扩展边界框，确保完全覆盖
+            expand_pixels = 3
+            x = max(0, x - expand_pixels)
+            y = max(0, y - expand_pixels)
+            w = min(image_shape[1] - x, w + 2 * expand_pixels)
+            h = min(image_shape[0] - y, h + 2 * expand_pixels)
+            
+            cv2.rectangle(mask, (x, y), (x + w, y + h), 255, -1)
+        
+        return mask
+    
+    def is_likely_field_line_remnant(self, contour, aspect_ratio, area):
+        """判断轮廓是否可能是场地黑线的残留"""
+        # 检查长宽比 - 场地黑线通常很细长
+        if aspect_ratio > 5:
+            return True
+            
+        # 检查轮廓的线性特征
+        # 如果轮廓可以很好地用直线拟合，可能是黑线残留
+        try:
+            # 计算轮廓的拟合直线
+            [vx, vy, x0, y0] = cv2.fitLine(contour, cv2.DIST_L2, 0, 0.01, 0.01)
+            
+            # 计算轮廓点到拟合直线的平均距离
+            points = contour.reshape(-1, 2)
+            line_distances = []
+            
+            for point in points:
+                px, py = point
+                # 点到直线的距离公式
+                distance = abs((py - y0) * vx - (px - x0) * vy) / np.sqrt(vx*vx + vy*vy)
+                line_distances.append(distance)
+            
+            avg_distance = np.mean(line_distances)
+            
+            # 如果平均距离很小且长宽比较大，很可能是黑线残留
+            if avg_distance < 3 and aspect_ratio > 3:
+                return True
+                
+        except:
+            pass
+            
+        # 检查轮廓的方向性
+        # 获取轮廓的最小外接矩形
+        rect = cv2.minAreaRect(contour)
+        (cx, cy), (width, height), angle = rect
+        
+        # 计算最小外接矩形的长宽比
+        rect_aspect_ratio = max(width, height) / min(width, height) if min(width, height) > 0 else 0
+        
+        # 如果最小外接矩形也很细长，可能是黑线
+        if rect_aspect_ratio > 6:
+            return True
+            
+        return False
+
+    def detect_a4_paper(self, image):
+        """完整的A4纸检测 - 继承自step1的黑色区域检测算法，增加场地黑线过滤"""
+        # 使用HSV颜色空间检测
+        hsv_mask, hsv_img = self.detect_black_regions_hsv(image)
+        
+        # 检测场地黑线
+        field_lines = self.detect_field_lines(hsv_mask)
+        
+        # 如果检测到场地黑线，从黑色区域掩码中移除它们
+        if field_lines:
+            field_line_mask = self.create_field_line_mask(image.shape, field_lines)
+            # 从原始黑色掩码中减去场地黑线掩码
+            hsv_mask = cv2.subtract(hsv_mask, field_line_mask)
+        
+        hsv_processed, hsv_closed = self.apply_morphological_operations(hsv_mask)
+        
+        # 查找轮廓和层次结构
+        contours, hierarchy = cv2.findContours(
+            hsv_processed, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
+        )
+        
+        # 分析轮廓层次结构，寻找环状结构
+        candidates = self.analyze_contour_hierarchy(contours, hierarchy)
+        
+        if not candidates:
+            return None
+        
+        # 评分候选目标
+        scored_candidates = self.score_black_region_candidates(candidates)
+        
+        # 强制要求环状结构
+        final_targets = [c for c in scored_candidates if c.get('is_ring_structure', False)]
+        
+        if not final_targets:
+            return None
+            
+        # 返回最佳目标
+        best_target = final_targets[0]
+        return {
+            'contour': best_target['contour'],
+            'area': best_target['area'],
+            'bbox': best_target['bbox'],
+            'center': best_target['center'],
+            'score': best_target['score'],
+            'is_ring_structure': best_target['is_ring_structure'],
+            'inner_outer_ratio': best_target.get('inner_outer_ratio', 0)
+        }
+    
+    def detect_black_regions_hsv(self, image):
+        """使用HSV颜色空间检测黑色区域 - 继承自step1"""
+        # 转换到HSV颜色空间
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        
+        # 创建黑色掩码
+        black_mask = cv2.inRange(hsv, self.hsv_black_lower, self.hsv_black_upper)
+        
+        return black_mask, hsv
+    
+    def apply_morphological_operations(self, mask):
+        """对黑色区域掩码进行形态学操作 - 继承自step1"""
+        # 创建形态学核
+        morph_kernel_size = 5
+        kernel = np.ones((morph_kernel_size, morph_kernel_size), np.uint8)
+        
+        # 闭运算：连接断开的黑色区域
+        closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        
+        # 开运算：去除噪声
+        opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel, iterations=1)
+        
+        return opened, closed
+    
+    def analyze_contour_hierarchy(self, contours, hierarchy):
+        """分析轮廓层次结构，寻找环状结构 - 继承自step1，增加场地黑线过滤"""
+        ring_candidates = []
+        
+        if hierarchy is None:
+            return ring_candidates
+        
+        # hierarchy[i] = [next, previous, first_child, parent]
+        for i, contour in enumerate(contours):
+            # 检查轮廓面积
+            area = cv2.contourArea(contour)
+            if area < 2000:
+                continue
+            
+            # 获取层次信息
+            next_contour, prev_contour, first_child, parent = hierarchy[0][i]
+            
+            # 检查是否有子轮廓（内部白色区域）
+            has_inner_region = first_child != -1
+            
+            # 计算基本特征
+            x, y, w, h = cv2.boundingRect(contour)
+            aspect_ratio = max(w, h) / min(w, h) if min(w, h) > 0 else 0
+            center = (x + w//2, y + h//2)
+            
+            # 增强的形状约束 - 过滤场地黑线残留和异常形状
+            if self.is_likely_field_line_remnant(contour, aspect_ratio, area):
+                continue  # 跳过疑似场地黑线残留
+                
+            # 检查轮廓的紧凑性（圆度）
+            perimeter = cv2.arcLength(contour, True)
+            if perimeter > 0:
+                compactness = 4 * np.pi * area / (perimeter * perimeter)
+                # A4纸应该有合理的紧凑性，过于细长的形状会被过滤
+                if compactness < 0.1:  # 过于细长的形状
+                    continue
+            
+            # 轮廓近似
+            epsilon = 0.02 * cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, epsilon, True)
+            
+            candidate = {
+                'contour': contour,
+                'approx': approx,
+                'area': area,
+                'bbox': (x, y, w, h),
+                'aspect_ratio': aspect_ratio,
+                'center': center,
+                'vertices': len(approx),
+                'has_inner_region': has_inner_region,
+                'hierarchy_info': hierarchy[0][i],
+                'is_outer_contour': parent == -1,
+                'score': 0
+            }
+            
+            # 如果有子轮廓，分析内外关系
+            if has_inner_region:
+                child_idx = first_child
+                inner_areas = []
+                
+                while child_idx != -1:
+                    child_contour = contours[child_idx]
+                    child_area = cv2.contourArea(child_contour)
+                    inner_areas.append(child_area)
+                    
+                    # 获取下一个兄弟轮廓
+                    child_idx = hierarchy[0][child_idx][0]
+                
+                if inner_areas:
+                    max_inner_area = max(inner_areas)
+                    total_inner_area = sum(inner_areas)
+                    
+                    candidate['max_inner_area'] = max_inner_area
+                    candidate['total_inner_area'] = total_inner_area
+                    candidate['inner_outer_ratio'] = max_inner_area / area
+                    candidate['is_ring_structure'] = (
+                        self.inner_outer_ratio_min <= candidate['inner_outer_ratio'] <= self.inner_outer_ratio_max
+                    )
+            else:
+                candidate['max_inner_area'] = 0
+                candidate['total_inner_area'] = 0
+                candidate['inner_outer_ratio'] = 0
+                candidate['is_ring_structure'] = False
+            
+            ring_candidates.append(candidate)
+        
+        return ring_candidates
+    
+    def score_black_region_candidates(self, candidates):
+        """基于黑色区域特征的评分系统 - 继承自step1"""
+        for candidate in candidates:
+            score = 0
+            
+            # 面积评分 - 黑色边框区域应该有适当大小
+            area = candidate['area']
+            if self.min_black_area <= area <= self.max_black_area:
+                score += 30
+            elif area <= self.max_black_area * 2:
+                score += 20
+            elif area >= self.min_black_area / 2:
+                score += 10
+            
+            # A4纸长宽比评分
+            a4_aspect_ratio = 297.0 / 210.0
+            aspect_ratio_tolerance = 0.5
+            aspect_ratio = candidate['aspect_ratio']
+            if abs(aspect_ratio - a4_aspect_ratio) <= aspect_ratio_tolerance:
+                score += 35  # A4纸比例的高分奖励
+            elif 1.2 <= aspect_ratio <= 2.0:
+                score += 25
+            elif 1.0 <= aspect_ratio <= 3.0:
+                score += 15
+            
+            # 顶点数评分 - 矩形应该有4个顶点
+            vertices = candidate['vertices']
+            if vertices == 4:
+                score += 25
+            elif 3 <= vertices <= 6:
+                score += 15
+            elif vertices <= 8:
+                score += 5
+            
+            # 环状结构评分 - 这是关键特征
+            if candidate['has_inner_region']:
+                score += 20  # 有内部区域加分
+                
+                if candidate['is_ring_structure']:
+                    score += 30  # 符合环状结构特征高分
+                    
+                    # 内外面积比评分
+                    ratio = candidate['inner_outer_ratio']
+                    if 0.4 <= ratio <= 0.7:  # 理想的内外比例
+                        score += 25
+                    elif 0.2 <= ratio <= 0.8:
+                        score += 15
+                    
+                    # 内部区域面积评分
+                    inner_area = candidate['max_inner_area']
+                    if self.min_inner_area <= inner_area <= self.max_inner_area:
+                        score += 20
+                    elif inner_area >= self.min_inner_area / 2:
+                        score += 10
+            
+            # 外轮廓奖励
+            if candidate['is_outer_contour']:
+                score += 10
+            
+            # 增强的A4纸特征检查 - 降低场地黑线误识别
+            # 检查轮廓的紧凑性
+            perimeter = cv2.arcLength(candidate['contour'], True)
+            if perimeter > 0:
+                compactness = 4 * np.pi * area / (perimeter * perimeter)
+                # A4纸应该相对紧凑，不应该过于细长
+                if compactness > 0.3:
+                    score += 15  # 紧凑度好的加分
+                elif compactness > 0.2:
+                    score += 10
+                elif compactness < 0.1:
+                    score -= 20  # 过于细长的扣分
+            
+            # 检查是否可能是场地黑线残留
+            if self.is_likely_field_line_remnant(candidate['contour'], aspect_ratio, area):
+                score -= 50  # 大幅扣分
+            
+            # 强化A4纸形状特征 - 检查矩形度
+            # 计算轮廓与其最小外接矩形的匹配度
+            rect = cv2.minAreaRect(candidate['contour'])
+            rect_area = rect[1][0] * rect[1][1]
+            if rect_area > 0:
+                rect_match_ratio = area / rect_area
+                if rect_match_ratio > 0.8:  # 轮廓与矩形匹配度高
+                    score += 20
+                elif rect_match_ratio > 0.6:
+                    score += 10
+                elif rect_match_ratio < 0.3:  # 形状很不规则
+                    score -= 15
+                    
+            # 检查轮廓的稳定性 - A4纸应该有明确的边界
+            hull = cv2.convexHull(candidate['contour'])
+            hull_area = cv2.contourArea(hull)
+            if hull_area > 0:
+                solidity = area / hull_area
+                if solidity > 0.9:  # 轮廓很接近凸包，形状规整
+                    score += 15
+                elif solidity < 0.7:  # 形状不规整
+                    score -= 10
+            
+            candidate['score'] = score
+        
+        # 按评分排序
+        candidates.sort(key=lambda x: x['score'], reverse=True)
+        return candidates
+    
+    def calculate_distance_d(self, target_contour):
+        """计算摄像头到A4纸的距离D（毫米） - 继承自step2"""
+        # 获取A4纸轮廓的高度
+        contour_points = target_contour.reshape(-1, 2)
+        top_y = np.min(contour_points[:, 1])
+        bottom_y = np.max(contour_points[:, 1])
+        
+        # 方法1：使用边界框高度
+        x, y, w, h = cv2.boundingRect(target_contour)
+        h_pixel_bbox = h
+        
+        # 方法2：更精确的方法 - 获取轮廓的最上点和最下点
+        top_point = tuple(target_contour[target_contour[:, :, 1].argmin()][0])
+        bottom_point = tuple(target_contour[target_contour[:, :, 1].argmax()][0])
+        h_pixel_precise = bottom_point[1] - top_point[1]
+        
+        # 使用更精确的方法
+        h_pixel = max(h_pixel_precise, h_pixel_bbox)
+        
+        if h_pixel <= 0:
+            return None
+            
+        # 使用实际的相机参数
+        fy = self.focal_length_y if self.focal_length_y else 1200
+            
+        # 计算距离：Z = (fy * A4真实高度) / h_pixel
+        distance_m = (fy * self.a4_real_height) / h_pixel
+        distance_mm = distance_m * 1000
+        
+        return distance_mm
+    
+    def smooth_distance(self, distance: float) -> float:
+        """距离平滑滤波 - 继承自step2"""
+        self.distance_history.append(distance)
+        
+        # 保持历史记录长度
+        if len(self.distance_history) > self.history_size:
+            self.distance_history.pop(0)
+        
+        # 中值滤波 + 平均滤波
+        if len(self.distance_history) >= 3:
+            sorted_history = sorted(self.distance_history)
+            median_value = sorted_history[len(sorted_history)//2]
+            
+            # 去除异常值后求平均
+            filtered_values = [d for d in self.distance_history 
+                             if abs(d - median_value) < median_value * 0.3]
+            
+            if filtered_values:
+                return np.mean(filtered_values)
+        
+        return distance
+    
+    def get_perspective_transform(self, target_contour):
+        """获取透视变换矩阵 - 继承自shape_detection_measurement"""
+        # 获取A4纸的四个角点
+        epsilon = 0.02 * cv2.arcLength(target_contour, True)
+        approx = cv2.approxPolyDP(target_contour, epsilon, True)
+        
+        if len(approx) != 4:
+            # 如果不是四边形，使用最小外接矩形
+            rect = cv2.minAreaRect(target_contour)
+            box = cv2.boxPoints(rect)
+            approx = np.array(box, dtype='float32')
+        else:
+            approx = approx.reshape(-1, 2).astype('float32')
+        
+        # 排序角点
+        pts_src = self.sort_corner_points(approx)
+        
+        # 定义目标点（标准矩形）
+        pts_dst = np.array([
+            [0, 0],                                    # 左上
+            [self.output_width, 0],                   # 右上
+            [self.output_width, self.output_height],  # 右下
+            [0, self.output_height]                   # 左下
+        ], dtype='float32')
+        
+        # 计算透视变换矩阵
+        M = cv2.getPerspectiveTransform(pts_src, pts_dst)
+        
+        return M, pts_src
+    
+    def sort_corner_points(self, points):
+        """对四个角点进行排序：左上、右上、右下、左下 - 继承自shape_detection_measurement"""
+        # 计算质心
+        center = np.mean(points, axis=0)
+        
+        # 按照相对于质心的角度排序
+        angles = []
+        for point in points:
+            angle = math.atan2(point[1] - center[1], point[0] - center[0])
+            angles.append(angle)
+        
+        # 将角度和点配对并排序
+        angle_point_pairs = list(zip(angles, points))
+        angle_point_pairs.sort(key=lambda x: x[0])
+        
+        # 找到角度最小的点（最右边的点）
+        sorted_points = [pair[1] for pair in angle_point_pairs]
+        
+        # 重新排列为左上、右上、右下、左下的顺序
+        points_array = np.array(sorted_points)
+        
+        # 按y坐标排序
+        y_sorted = points_array[np.argsort(points_array[:, 1])]
+        
+        # 上面两个点按x坐标排序
+        top_points = y_sorted[:2]
+        top_sorted = top_points[np.argsort(top_points[:, 0])]
+        
+        # 下面两个点按x坐标排序
+        bottom_points = y_sorted[2:]
+        bottom_sorted = bottom_points[np.argsort(bottom_points[:, 0])]
+        
+        # 组合：左上、右上、右下、左下
+        ordered_points = np.array([
+            top_sorted[0],     # 左上
+            top_sorted[1],     # 右上
+            bottom_sorted[1],  # 右下
+            bottom_sorted[0]   # 左下
+        ], dtype='float32')
+        
+        return ordered_points
+    
+    def detect_shape_and_calculate_x(self, warped_image):
+        """检测几何形状并计算参数x - 继承自shape_detection_measurement的完整算法"""
+        print("=== 步骤4：形状检测与测量 ===")
+        
+        # 检测黑色轮廓
+        filtered_contours, binary, binary_processed = self.detect_black_contours(warped_image)
+        
+        print(f"轮廓过滤结果: {len(filtered_contours)} 个有效轮廓")
+        
+        if not filtered_contours:
+            print("[ERROR] 没有找到有效轮廓！")
+            return None, None, binary_processed
+        
+        # 识别形状并计算测量值
+        shapes_with_measurements = []
+        
+        for i, contour in enumerate(filtered_contours):
+            area = cv2.contourArea(contour)
+            print(f"正在识别轮廓{i+1}，面积={area:.0f}像素")
+            
+            shape_info = self.identify_shape(contour)
+            if shape_info:
+                confidence = shape_info.get('confidence', 0.5)
+                shape_type = shape_info.get('type', 'unknown')
+                vertices = shape_info.get('vertices', 0)
+                
+                print(f"  识别结果: {shape_type}, 顶点={vertices}, 置信度={confidence:.3f}")
+                
+                # 根据最新识别率调整置信度要求
+                min_confidence_map = {
+                    'circle': 0.4,      # 圆形已达到90%，保持当前要求
+                    'triangle': 0.35,   # 三角形70%，进一步降低要求
+                    'square': 0.6,      # 正方形95%，保持高要求
+                    'rectangle': 0.5,   # 矩形中等要求
+                    'polygon': 0.3      # 多边形较低要求
+                }
+                min_confidence = min_confidence_map.get(shape_type, 0.4)
+                
+                if confidence > min_confidence:
+                    measurements = self.calculate_shape_measurements(shape_info)
+                    shapes_with_measurements.append((shape_info, measurements))
+                    print(f"  [通过] 置信度检查，添加到结果列表")
+                else:
+                    print(f"  [失败] 置信度太低 ({confidence:.3f} < {min_confidence})")
+            else:
+                print(f"  [失败] 形状识别失败")
+        
+        print(f"形状识别结果: {len(shapes_with_measurements)} 个有效形状")
+        
+        if not shapes_with_measurements:
+            print("[ERROR] 所有轮廓的形状识别都失败！")
+            return None, None, binary_processed
+        
+        # 按综合评分排序：面积权重70% + 置信度权重30%
+        for shape_info, measurements in shapes_with_measurements:
+            area = shape_info['area']
+            confidence = shape_info.get('confidence', 0)
+            
+            # 面积归一化 (假设最大合理面积为100000像素)
+            area_score = min(area / 100000.0, 1.0) * 0.7
+            confidence_score = confidence * 0.3
+            
+            combined_score = area_score + confidence_score
+            shape_info['combined_score'] = combined_score
+            
+            print(f"  综合评分: 面积权重={area_score:.3f}, 置信度权重={confidence_score:.3f}, 总分={combined_score:.3f}")
+        
+        # 按综合评分排序
+        shapes_with_measurements.sort(key=lambda x: x[0].get('combined_score', 0), reverse=True)
+        best_shape_info, best_measurements = shapes_with_measurements[0]
+        
+        x_value = best_measurements['key_parameter']
+        shape_type = best_measurements['shape_type']
+        
+        print(f"[成功] 选择最佳形状: {shape_type}, x={x_value}mm")
+        
+        return best_shape_info, x_value, binary_processed
+    
+    def detect_black_contours(self, warped_image):
+        """在透视变换后的图像中检测黑色轮廓 - 继承自shape_detection_measurement"""
+        print("=== 步骤3：检测黑色轮廓 ===")
+        
+        # 转为灰度图
+        if len(warped_image.shape) == 3:
+            gray = cv2.cvtColor(warped_image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = warped_image
+        
+        print(f"灰度图像统计: 最小值={gray.min()}, 最大值={gray.max()}, 平均值={gray.mean():.1f}")
+        
+        # 尝试多种二值化方法
+        methods_results = []
+        
+        # 方法1: 固定阈值 - 直接检测黑色区域
+        _, binary1 = cv2.threshold(gray, self.binary_threshold, 255, cv2.THRESH_BINARY_INV)
+        contours1, _ = cv2.findContours(binary1, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        methods_results.append(("固定阈值", binary1, binary1, contours1))
+        
+        # 方法2: Otsu自动阈值 - 直接检测黑色区域
+        _, binary2 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        contours2, _ = cv2.findContours(binary2, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        methods_results.append(("Otsu阈值", binary2, binary2, contours2))
+        
+        # 方法3: 自适应阈值 - 直接检测黑色区域
+        binary3 = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                       cv2.THRESH_BINARY_INV, 21, 10)
+        contours3, _ = cv2.findContours(binary3, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        methods_results.append(("自适应阈值", binary3, binary3, contours3))
+        
+        # 方法4: 更激进的固定阈值 - 直接检测黑色区域
+        _, binary4 = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
+        contours4, _ = cv2.findContours(binary4, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        methods_results.append(("高阈值", binary4, binary4, contours4))
+        
+        # 评估每种方法找到的轮廓
+        best_method = None
+        best_contours = []
+        best_binary = None
+        best_binary_processed = None
+        best_score = 0
+        
+        total_area = self.output_width * self.output_height
+        
+        print("二值化方法对比:")
+        for method_name, binary, binary_inv, contours in methods_results:
+            valid_contours = [c for c in contours if cv2.contourArea(c) >= 500]  # 临时降低阈值用于评估
+            large_contours = [c for c in contours if cv2.contourArea(c) >= 5000]  # 真正的大轮廓
+            
+            if contours:
+                max_area = max(cv2.contourArea(c) for c in contours)
+                avg_large_area = np.mean([cv2.contourArea(c) for c in large_contours]) if large_contours else 0
+            else:
+                max_area = 0
+                avg_large_area = 0
+            
+            print(f"  {method_name}: 总轮廓={len(contours)}, 有效轮廓(>500px)={len(valid_contours)}, 大轮廓(>5000px)={len(large_contours)}, 最大面积={max_area:.0f}")
+            
+            # 评估策略：优先考虑大轮廓
+            score = len(large_contours) * 1000 + avg_large_area - len(contours) * 0.1
+            print(f"    评估得分: {score:.1f} (大轮廓数×1000 + 平均大面积 - 总轮廓×0.1)")
+            
+            if score > best_score:
+                best_score = score
+                best_method = method_name
+                best_contours = contours
+                best_binary = binary
+                best_binary_processed = binary_inv
+        
+        print(f"选择最佳方法: {best_method}")
+        
+        # 如果没有找到好的轮廓，使用固定阈值作为fallback
+        if best_score == 0:
+            print("所有方法都没找到有效轮廓，使用默认固定阈值")
+            best_method = "固定阈值(默认)"
+            best_binary = methods_results[0][1]
+            best_binary_processed = methods_results[0][2]
+            best_contours = methods_results[0][3]
+        
+        # 轻度形态学操作（只用于选中的最佳方法）
+        kernel = np.ones((3, 3), np.uint8)
+        best_binary_final = cv2.morphologyEx(best_binary_processed, cv2.MORPH_OPEN, kernel, iterations=1)
+        best_binary_final = cv2.morphologyEx(best_binary_final, cv2.MORPH_CLOSE, kernel, iterations=1)
+        
+        # 重新查找轮廓
+        contours, hierarchy = cv2.findContours(
+            best_binary_final, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        
+        print(f"形态学操作后找到 {len(contours)} 个轮廓")
+        
+        # 检查是否检测到了整个图像边界
+        if contours:
+            max_contour_area = max(cv2.contourArea(c) for c in contours)
+            max_area_percentage = (max_contour_area / total_area) * 100
+            
+            print(f"最大轮廓面积占比: {max_area_percentage:.1f}%")
+            
+            if max_area_percentage > 95:  # 如果最大轮廓占图像95%以上
+                print(f"检测到边界轮廓 ({max_area_percentage:.1f}%)，尝试检测内部轮廓...")
+                
+                # 策略1: 使用层次结构检测内部轮廓
+                contours_tree, hierarchy = cv2.findContours(best_binary_final, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+                print(f"树形检测找到 {len(contours_tree)} 个轮廓")
+                
+                # 寻找内部轮廓（有父轮廓的轮廓）
+                internal_contours = []
+                if hierarchy is not None:
+                    for i, contour in enumerate(contours_tree):
+                        # hierarchy[i] = [next, previous, first_child, parent]
+                        next_contour, prev_contour, first_child, parent = hierarchy[0][i]
+                        
+                        # 如果有父轮廓，说明是内部轮廓
+                        if parent != -1:
+                            area = cv2.contourArea(contour)
+                            area_percentage = (area / total_area) * 100
+                            print(f"  内部轮廓: 面积={area:.0f} ({area_percentage:.2f}%)")
+                            
+                            # 合理大小的内部轮廓
+                            if 0.01 <= area_percentage <= 50:
+                                internal_contours.append(contour)
+                
+                print(f"找到 {len(internal_contours)} 个内部轮廓")
+                
+                if internal_contours:
+                    contours = internal_contours
+                else:
+                    # 策略2: 反转图像检测
+                    print("内部轮廓检测失败，尝试反转图像...")
+                    inverted_image = cv2.bitwise_not(best_binary_final)
+                    contours_ext, _ = cv2.findContours(inverted_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    
+                    # 过滤掉过大和过小的轮廓
+                    filtered = []
+                    for c in contours_ext:
+                        area = cv2.contourArea(c)
+                        area_percentage = (area / total_area) * 100
+                        
+                        # 寻找合理大小的轮廓：0.01% - 50%
+                        if 0.01 <= area_percentage <= 50:
+                            filtered.append(c)
+                    
+                    print(f"反转图像检测到 {len(filtered)} 个合理大小的轮廓")
+                    
+                    if filtered:
+                        contours = filtered
+                    else:
+                        # 策略3: 更激进的面积阈值
+                        print("反转图像也失败，尝试更宽松的面积阈值...")
+                        relaxed_contours = []
+                        for c in contours_ext:
+                            area = cv2.contourArea(c)
+                            # 非常宽松的阈值：任何大于100像素的轮廓
+                            if area >= 100:
+                                relaxed_contours.append(c)
+                        
+                        print(f"宽松阈值检测到 {len(relaxed_contours)} 个轮廓")
+                        if relaxed_contours:
+                            contours = relaxed_contours
+        
+        # 过滤轮廓
+        filtered_contours = []
+        print(f"透视变换后找到 {len(contours)} 个轮廓")
+        print(f"当前面积阈值: 最小={self.min_contour_area}, 最大={self.max_contour_area}")
+        
+        for i, contour in enumerate(contours):
+            area = cv2.contourArea(contour)
+            area_mm2 = area * (self.pixel_to_mm_ratio ** 2)
+            area_percentage = (area / total_area) * 100
+            
+            # 获取轮廓边界框信息
+            x, y, w, h = cv2.boundingRect(contour)
+            
+            print(f"  轮廓{i+1}: 面积={area:.0f}像素 ({area_mm2:.1f}mm^2, {area_percentage:.1f}%) 边界[{w}x{h}]")
+            
+            # 特殊处理：如果轮廓面积超过图像面积的80%，可能是整个背景，跳过
+            if area_percentage > 80:
+                print(f"    - [SKIP] Area too large, possible background region (>{area_percentage:.1f}%)")
+                continue
+                
+            # 特殊处理：如果轮廓几乎是整个图像的边界，跳过
+            if (w > self.output_width * 0.9 and h > self.output_height * 0.9):
+                print(f"    - [SKIP] Contour covers entire image region ({w}x{h})")
+                continue
+            
+            print(f"    面积检查: {self.min_contour_area} <= {area} <= {self.max_contour_area} ?")
+            
+            # 执行面积检查
+            area_check_min = area >= self.min_contour_area
+            area_check_max = area <= self.max_contour_area
+            area_check_pass = area_check_min and area_check_max
+            
+            print(f"    检查详情: area>=min_area? {area_check_min}, area<=max_area? {area_check_max}, 总结果: {area_check_pass}")
+            
+            if area_check_pass:
+                filtered_contours.append(contour)
+                print(f"    [OK] Contour passed area filter")
+            else:
+                if not area_check_min:
+                    print(f"    - [FAIL] Area too small (< {self.min_contour_area})")
+                else:
+                    print(f"    - [FAIL] Area too large (> {self.max_contour_area})")
+        
+        print("=== AREA FILTER RESULTS ===")
+        print(f"Remaining contours after area filter: {len(filtered_contours)}")
+        
+        if len(filtered_contours) == 0:
+            print("[WARNING] All contours rejected by area filter!")
+            print("This may cause detection failure.")
+        else:
+            print("[SUCCESS] Contours passed area filter, continuing to shape recognition...")
+        
+        return filtered_contours, best_binary, best_binary_final
+    
+    def identify_shape(self, contour):
+        """增强版形状识别 - 多特征融合算法"""
+        perimeter = cv2.arcLength(contour, True)
+        area = cv2.contourArea(contour)
+        
+        if perimeter == 0 or area == 0:
+            return None
+        
+        # 计算基本几何特征
+        circularity = 4 * math.pi * area / (perimeter * perimeter)
+        print(f"      圆度检查: {circularity:.3f}")
+        
+        # 尝试多种epsilon值进行轮廓逼近
+        approximations = []
+        for epsilon_factor in [0.015, 0.02, 0.025, 0.03, 0.035, 0.04, 0.045, 0.05]:
+            epsilon = epsilon_factor * perimeter
+            approx = cv2.approxPolyDP(contour, epsilon, True)
+            vertices = len(approx)
+            
+            try:
+                approx_area = cv2.contourArea(approx)
+                area_diff_ratio = abs(area - approx_area) / area if area > 0 else 1.0
+                approximations.append({
+                    'epsilon_factor': epsilon_factor,
+                    'approx': approx,
+                    'vertices': vertices,
+                    'error': area_diff_ratio
+                })
+            except:
+                continue
+        
+        if not approximations:
+            return None
+        
+        # 形状候选分析
+        shape_candidates = []
+        
+        # === 圆形候选分析 ===
+        circle_confidence = self.analyze_circle_features(contour, area, perimeter, circularity)
+        # 降低圆形候选门槛，增加检测机会
+        if circle_confidence > 0.3:
+            shape_candidates.append({
+                'type': 'circle',
+                'confidence': circle_confidence,
+                'approx': None,
+                'vertices': 0
+            })
+            print(f"      圆形候选: 置信度={circle_confidence:.3f}")
+        
+        # 额外的低圆度圆形检测 - 针对椭圆或不完美的圆
+        elif circularity > 0.2:  # 非常低的圆度阈值
+            # 检查长宽比是否接近圆形
+            x, y, w, h = cv2.boundingRect(contour)
+            aspect_ratio = max(w, h) / min(w, h) if min(w, h) > 0 else 999
+            
+            if aspect_ratio < 2.0:  # 不是太扁的椭圆
+                # 重新计算置信度，但降低标准
+                low_threshold_circle_confidence = circle_confidence * 0.8  # 降权处理
+                
+                if low_threshold_circle_confidence > 0.25:
+                    shape_candidates.append({
+                        'type': 'circle',
+                        'confidence': low_threshold_circle_confidence,
+                        'approx': None,
+                        'vertices': 0
+                    })
+                    print(f"      低圆度圆形候选: 圆度={circularity:.3f}, 长宽比={aspect_ratio:.3f}, 置信度={low_threshold_circle_confidence:.3f}")
+        
+        # === 多边形候选分析 ===
+        # 根据顶点数分组并选择最佳逼近
+        vertex_groups = {}
+        for approx_result in approximations:
+            vertices = approx_result['vertices']
+            if vertices not in vertex_groups:
+                vertex_groups[vertices] = []
+            vertex_groups[vertices].append(approx_result)
+        
+        # 为每种顶点数生成候选
+        for vertices, group in vertex_groups.items():
+            if vertices < 3:
+                continue
+                
+            # 选择该顶点数下的最佳逼近
+            best_approx = min(group, key=lambda x: x['error'])
+            
+            if vertices == 3:
+                # 三角形分析 - 生成多个候选
+                triangle_confidence = self.analyze_triangle_features(best_approx['approx'], area, perimeter)
+                
+                # 主要三角形候选
+                if triangle_confidence > 0.35:  # 降低门槛
+                    shape_candidates.append({
+                        'type': 'triangle',
+                        'confidence': triangle_confidence,
+                        'approx': best_approx['approx'],
+                        'vertices': vertices
+                    })
+                    print(f"      三角形候选: 置信度={triangle_confidence:.3f}")
+                
+                # 尝试其他epsilon值的三角形候选
+                for approx_result in group:
+                    if approx_result != best_approx:
+                        alt_triangle_confidence = self.analyze_triangle_features(approx_result['approx'], area, perimeter)
+                        # 给备选逼近一些置信度惩罚，但仍然考虑
+                        alt_triangle_confidence *= 0.9
+                        
+                        if alt_triangle_confidence > triangle_confidence and alt_triangle_confidence > 0.35:
+                            # 如果备选的置信度更高，添加为候选
+                            shape_candidates.append({
+                                'type': 'triangle',
+                                'confidence': alt_triangle_confidence,
+                                'approx': approx_result['approx'],
+                                'vertices': vertices
+                            })
+                            print(f"      备选三角形候选: 置信度={alt_triangle_confidence:.3f} (epsilon={approx_result['epsilon_factor']})")
+            
+            elif vertices == 4 or vertices == 5:
+                # 4-5个顶点：可能是三角形的过度逼近
+                # 检查是否实际上是三角形
+                triangle_confidence_alt = self.analyze_triangle_from_multi_vertex(best_approx['approx'], area, perimeter, vertices)
+                
+                if triangle_confidence_alt > 0.35:
+                    shape_candidates.append({
+                        'type': 'triangle',
+                        'confidence': triangle_confidence_alt,
+                        'approx': best_approx['approx'],
+                        'vertices': 3  # 虽然原始有更多顶点，但识别为三角形
+                    })
+                    print(f"      多顶点三角形候选: 原顶点={vertices}, 置信度={triangle_confidence_alt:.3f}")
+                
+                # 继续原有的四边形检查
+                if vertices == 4:
+                    square_confidence, rect_confidence = self.analyze_quadrilateral_features(best_approx['approx'], area, perimeter)
+                    
+                    if square_confidence > rect_confidence and square_confidence > 0.4:
+                        shape_candidates.append({
+                            'type': 'square',
+                            'confidence': square_confidence,
+                            'approx': best_approx['approx'],
+                            'vertices': vertices
+                        })
+                        print(f"      正方形候选: 置信度={square_confidence:.3f}")
+                    elif rect_confidence > 0.4:
+                        shape_candidates.append({
+                            'type': 'rectangle',
+                            'confidence': rect_confidence,
+                            'approx': best_approx['approx'],
+                            'vertices': vertices
+                        })
+                        print(f"      矩形候选: 置信度={rect_confidence:.3f}")
+            
+            elif vertices >= 6:
+                # 6+顶点形状 - 可能是圆形的过度逼近
+                # 二次圆形检查：高顶点数 + 高圆度 = 可能的圆形
+                if vertices >= 8 and circularity > 0.4:
+                    # 重新以更宽松的标准评估圆形可能性
+                    circle_confidence_secondary = self.analyze_circle_features(contour, area, perimeter, circularity)
+                    # 对多顶点的潜在圆形给予置信度加成
+                    circle_confidence_secondary = min(circle_confidence_secondary + 0.1, 1.0)
+                    
+                    if circle_confidence_secondary > 0.4:
+                        shape_candidates.append({
+                            'type': 'circle',
+                            'confidence': circle_confidence_secondary,
+                            'approx': None,
+                            'vertices': 0
+                        })
+                        print(f"      多顶点圆形候选: 顶点={vertices}, 圆度={circularity:.3f}, 置信度={circle_confidence_secondary:.3f}")
+                
+                # 普通多边形候选
+                if vertices <= 12:  # 限制最大顶点数
+                    poly_confidence = 0.5 - (vertices - 6) * 0.05  # 顶点越多置信度越低
+                    poly_confidence = max(poly_confidence, 0.2)
+                    
+                    shape_candidates.append({
+                        'type': 'polygon',
+                        'confidence': poly_confidence,
+                        'approx': best_approx['approx'],
+                        'vertices': vertices
+                    })
+                    print(f"      多边形候选: 顶点={vertices}, 置信度={poly_confidence:.3f}")
+        
+        # 选择最佳候选
+        if not shape_candidates:
+            print(f"      无有效候选，返回默认多边形")
+            # 使用最常见的顶点数
+            if vertex_groups:
+                most_common_vertices = max(vertex_groups.keys(), key=lambda x: len(vertex_groups[x]))
+                best_approx = min(vertex_groups[most_common_vertices], key=lambda x: x['error'])
+                return {
+                    'contour': contour,
+                    'approx': best_approx['approx'],
+                    'vertices': best_approx['vertices'],
+                    'area': area,
+                    'perimeter': perimeter,
+                    'type': 'polygon',
+                    'confidence': 0.3
+                }
+            return None
+        
+        # 选择置信度最高的候选
+        best_candidate = max(shape_candidates, key=lambda x: x['confidence'])
+        print(f"      最终选择: {best_candidate['type']}, 置信度={best_candidate['confidence']:.3f}")
+        
+        return {
+            'contour': contour,
+            'approx': best_candidate['approx'],
+            'vertices': best_candidate['vertices'],
+            'area': area,
+            'perimeter': perimeter,
+            'type': best_candidate['type'],
+            'confidence': best_candidate['confidence']
+        }
+    
+    def analyze_circle_features(self, contour, area, perimeter, circularity):
+        """优化的圆形特征分析 - 更宽松但准确"""
+        features_score = 0.0
+        
+        # 特征1: 圆度检查 (权重35%) - 放宽阈值
+        if circularity > 0.75:
+            features_score += 0.35
+        elif circularity > 0.65:
+            features_score += 0.30
+        elif circularity > 0.55:
+            features_score += 0.25
+        elif circularity > 0.45:
+            features_score += 0.20
+        elif circularity > 0.35:
+            features_score += 0.15
+        elif circularity > 0.25:
+            features_score += 0.10
+        
+        print(f"        圆度得分: {circularity:.3f} -> {min(features_score, 0.35):.3f}")
+        
+        # 特征2: 边界框长宽比 (权重25%) - 圆形应该接近正方形边界框
+        x, y, w, h = cv2.boundingRect(contour)
+        aspect_ratio = max(w, h) / min(w, h) if min(w, h) > 0 else 999
+        
+        aspect_score = 0.0
+        if aspect_ratio < 1.15:
+            aspect_score = 0.25
+        elif aspect_ratio < 1.3:
+            aspect_score = 0.20
+        elif aspect_ratio < 1.5:
+            aspect_score = 0.15
+        elif aspect_ratio < 2.0:
+            aspect_score = 0.10
+        elif aspect_ratio < 3.0:
+            aspect_score = 0.05
+        
+        features_score += aspect_score
+        print(f"        宽高比得分: {aspect_ratio:.3f} -> {aspect_score:.3f}")
+        
+        # 特征3: 最小外接圆填充度 (权重25%)
+        try:
+            (cx, cy), radius = cv2.minEnclosingCircle(contour)
+            circle_area = math.pi * radius * radius
+            fill_ratio = area / circle_area if circle_area > 0 else 0
+            
+            circle_score = 0.0
+            if fill_ratio > 0.75:
+                circle_score = 0.25
+            elif fill_ratio > 0.65:
+                circle_score = 0.20
+            elif fill_ratio > 0.55:
+                circle_score = 0.15
+            elif fill_ratio > 0.45:
+                circle_score = 0.10
+            elif fill_ratio > 0.35:
+                circle_score = 0.05
+            
+            features_score += circle_score
+            print(f"        外接圆填充度: {fill_ratio:.3f} -> {circle_score:.3f}")
+        except:
+            print(f"        外接圆计算失败")
+        
+        # 特征4: 凹凸性检查 (权重15%) - 圆形应该是凸形
+        try:
+            hull = cv2.convexHull(contour)
+            hull_area = cv2.contourArea(hull)
+            convexity = area / hull_area if hull_area > 0 else 0
+            
+            convex_score = 0.0
+            if convexity > 0.9:
+                convex_score = 0.15
+            elif convexity > 0.8:
+                convex_score = 0.12
+            elif convexity > 0.7:
+                convex_score = 0.08
+            elif convexity > 0.6:
+                convex_score = 0.05
+            
+            features_score += convex_score
+            print(f"        凸性得分: {convexity:.3f} -> {convex_score:.3f}")
+        except:
+            print(f"        凸性计算失败")
+        
+        final_score = min(features_score, 1.0)
+        print(f"        圆形总得分: {final_score:.3f}")
+        
+        return final_score
+    
+    def analyze_triangle_features(self, approx, area, perimeter):
+        """优化的三角形特征分析 - 更实用和宽松"""
+        if len(approx) != 3:
+            return 0.0
+        
+        features_score = 0.0
+        points = approx.reshape(-1, 2)
+        
+        # 特征1: 顶点数匹配 (权重25%)
+        features_score += 0.25
+        print(f"        三角形顶点数匹配: +0.25")
+        
+        # 特征2: 边长合理性检查 (权重35%) - 重点特征，更宽松
+        try:
+            side_lengths = []
+            for i in range(3):
+                p1 = points[i]
+                p2 = points[(i + 1) % 3]
+                length = np.linalg.norm(p1 - p2)
+                side_lengths.append(length)
+            
+            side_lengths.sort()  # 从小到大排序
+            edge_score = 0.0
+            
+            if side_lengths[0] > 0:
+                ratio_small_mid = side_lengths[1] / side_lengths[0]
+                ratio_small_large = side_lengths[2] / side_lengths[0]
+                
+                # 基础存在性检查 - 只要不是极端退化就给分
+                if ratio_small_large < 15.0:  # 更宽松：避免极端细长三角形
+                    edge_score += 0.20  # 增加基础分
+                    
+                if ratio_small_mid > 1.01:  # 更宽松：确保不是退化线段
+                    edge_score += 0.10
+                    
+                # 奖励合理的边长比例 - 范围更宽
+                if 1.05 < ratio_small_large < 5.0:  # 扩大合理范围
+                    edge_score += 0.05
+                elif 1.1 < ratio_small_large < 3.0:  # 理想范围给更多分
+                    edge_score += 0.10
+                
+                # 三角形不等式检查 - 新增
+                if (side_lengths[0] + side_lengths[1] > side_lengths[2] * 0.95):  # 略微宽松
+                    edge_score += 0.05
+                    
+            features_score += edge_score
+            print(f"        边长比例检查: [{side_lengths[0]:.1f}, {side_lengths[1]:.1f}, {side_lengths[2]:.1f}] -> +{edge_score:.3f}")
+            
+        except Exception as e:
+            print(f"        边长计算失败: {e}")
+        
+        # 特征3: 面积/周长比检查 (权重20%)
+        try:
+            # 三角形的面积与周长平方的比值有一定范围
+            area_perimeter_ratio = area / (perimeter * perimeter) if perimeter > 0 else 0
+            
+            ratio_score = 0.0
+            # 三角形的理论范围大约在 0.01 到 0.05 之间（根据形状而定）
+            if 0.005 < area_perimeter_ratio < 0.1:
+                ratio_score = 0.20
+            elif 0.002 < area_perimeter_ratio < 0.15:
+                ratio_score = 0.15
+            elif area_perimeter_ratio > 0.001:
+                ratio_score = 0.10
+                
+            features_score += ratio_score
+            print(f"        面积周长比: {area_perimeter_ratio:.6f} -> +{ratio_score:.3f}")
+            
+        except:
+            print(f"        面积周长比计算失败")
+        
+        # 特征4: 非常宽松的角度检查 (权重20%)
+        try:
+            angles = []
+            for i in range(3):
+                p1 = points[i]
+                p2 = points[(i + 1) % 3]
+                p3 = points[(i + 2) % 3]
+                
+                # 计算向量
+                v1 = p1 - p2
+                v2 = p3 - p2
+                
+                # 计算角度
+                dot_product = np.dot(v1, v2)
+                norms = np.linalg.norm(v1) * np.linalg.norm(v2)
+                
+                if norms > 0:
+                    cos_angle = np.clip(dot_product / norms, -1.0, 1.0)
+                    angle = math.degrees(math.acos(cos_angle))
+                    angles.append(angle)
+                else:
+                    angles.append(60)  # 默认值
+            
+            angle_score = 0.0
+            if len(angles) == 3:
+                min_angle = min(angles)
+                max_angle = max(angles)
+                angle_sum = sum(angles)
+                
+                # 基础角度和检查 - 非常宽松
+                if 140 < angle_sum < 220:  # 扩大范围：140-220度
+                    angle_score += 0.15  # 增加基础分
+                elif 120 < angle_sum < 240:  # 极宽松范围
+                    angle_score += 0.10
+                elif angle_sum > 90:  # 最低要求
+                    angle_score += 0.05
+                
+                # 角度合理性检查 - 更宽松
+                if min_angle > 2 and max_angle < 170:  # 极宽松：避免0度或180度
+                    angle_score += 0.05
+                elif min_angle > 1:  # 最低要求：不是完全退化
+                    angle_score += 0.03
+                    
+            features_score += angle_score
+            print(f"        角度检查: [{angles[0]:.1f}°, {angles[1]:.1f}°, {angles[2]:.1f}°] (和={sum(angles):.1f}°) -> +{angle_score:.3f}")
+            
+        except Exception as e:
+            print(f"        角度计算失败: {e}")
+            # 即使角度计算失败，也给一些基础分，避免完全失败
+            features_score += 0.05
+            print(f"        角度计算失败，给予基础分: +0.05")
+        
+        final_score = min(features_score, 1.0)
+        print(f"        三角形总得分: {final_score:.3f}")
+        
+        return final_score
+    
+    def analyze_triangle_from_multi_vertex(self, approx, area, perimeter, original_vertices):
+        """从多顶点轮廓中分析是否可能是三角形"""
+        if len(approx) < 3:
+            return 0.0
+        
+        # 尝试找到3个主要顶点
+        points = approx.reshape(-1, 2)
+        
+        # 方法1：使用凸包找到最远的3个点
+        hull = cv2.convexHull(approx)
+        if len(hull) >= 3:
+            hull_points = hull.reshape(-1, 2)
+            
+            # 如果凸包正好是3个点，很可能是三角形
+            if len(hull_points) == 3:
+                triangle_confidence = self.analyze_triangle_features(hull, area, perimeter)
+                triangle_confidence *= 0.9  # 轻微降权，因为是从多顶点推导的
+                print(f"        凸包三角形检查: 置信度={triangle_confidence:.3f}")
+                return triangle_confidence
+            
+            # 如果凸包有4-6个点，尝试找主要的3个顶点
+            elif 4 <= len(hull_points) <= 6:
+                # 计算所有点的角度
+                center = np.mean(hull_points, axis=0)
+                angles_with_points = []
+                
+                for point in hull_points:
+                    angle = math.atan2(point[1] - center[1], point[0] - center[0])
+                    angles_with_points.append((angle, point))
+                
+                # 按角度排序
+                angles_with_points.sort(key=lambda x: x[0])
+                
+                # 尝试选择3个最分散的点
+                if len(angles_with_points) >= 3:
+                    # 选择角度间隔最大的3个点
+                    selected_points = []
+                    
+                    # 简单策略：选择第1、中间、最后一个点
+                    n = len(angles_with_points)
+                    indices = [0, n//2, n-1] if n >= 3 else list(range(n))
+                    
+                    for i in indices:
+                        selected_points.append(angles_with_points[i][1])
+                    
+                    if len(selected_points) == 3:
+                        triangle_approx = np.array(selected_points, dtype=np.float32).reshape(-1, 1, 2)
+                        triangle_confidence = self.analyze_triangle_features(triangle_approx, area, perimeter)
+                        triangle_confidence *= 0.8  # 更多降权，因为是推测的
+                        print(f"        多顶点三角形推导: 原{original_vertices}顶点 -> 置信度={triangle_confidence:.3f}")
+                        return triangle_confidence
+        
+        # 方法2：如果凸包方法失败，尝试距离最远的3个点
+        try:
+            if len(points) >= 3:
+                # 计算所有点对的距离，找到最远的3个点
+                max_dist = 0
+                farthest_pair = (0, 1)
+                
+                for i in range(len(points)):
+                    for j in range(i+1, len(points)):
+                        dist = np.linalg.norm(points[i] - points[j])
+                        if dist > max_dist:
+                            max_dist = dist
+                            farthest_pair = (i, j)
+                
+                # 找到距离这两个点最远的第三个点
+                p1_idx, p2_idx = farthest_pair
+                max_area = 0
+                third_point_idx = 0
+                
+                for k in range(len(points)):
+                    if k != p1_idx and k != p2_idx:
+                        # 计算三角形面积
+                        triangle_area = 0.5 * abs(
+                            (points[p2_idx][0] - points[p1_idx][0]) * (points[k][1] - points[p1_idx][1]) -
+                            (points[k][0] - points[p1_idx][0]) * (points[p2_idx][1] - points[p1_idx][1])
+                        )
+                        if triangle_area > max_area:
+                            max_area = triangle_area
+                            third_point_idx = k
+                
+                # 构建三角形
+                triangle_points = [points[p1_idx], points[p2_idx], points[third_point_idx]]
+                triangle_approx = np.array(triangle_points, dtype=np.float32).reshape(-1, 1, 2)
+                
+                triangle_confidence = self.analyze_triangle_features(triangle_approx, area, perimeter)
+                triangle_confidence *= 0.7  # 降权，因为是启发式方法
+                print(f"        距离最远三角形推导: 置信度={triangle_confidence:.3f}")
+                return triangle_confidence
+                
+        except Exception as e:
+            print(f"        多顶点三角形分析失败: {e}")
+        
+        return 0.0  # 无法从多顶点中推导出三角形
+    
+    def analyze_quadrilateral_features(self, approx, area, perimeter):
+        """分析四边形特征，返回(正方形置信度, 矩形置信度)"""
+        if len(approx) != 4:
+            return 0.0, 0.0
+        
+        points = approx.reshape(-1, 2)
+        
+        # 计算边长
+        side_lengths = []
+        for i in range(4):
+            p1 = points[i]
+            p2 = points[(i + 1) % 4]
+            length = np.linalg.norm(p1 - p2)
+            side_lengths.append(length)
+        
+        # 计算角度
+        angles = []
+        try:
+            for i in range(4):
+                p1 = points[i]
+                p2 = points[(i + 1) % 4]
+                p3 = points[(i + 2) % 4]
+                
+                v1 = p1 - p2
+                v2 = p3 - p2
+                
+                cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+                cos_angle = np.clip(cos_angle, -1.0, 1.0)
+                angle = math.degrees(math.acos(cos_angle))
+                angles.append(angle)
+        except:
+            angles = [90, 90, 90, 90]  # 默认值
+        
+        # 基础四边形特征
+        base_quad_score = 0.0
+        
+        # 顶点数匹配
+        base_quad_score += 0.2
+        
+        # 角度检查 - 接近直角
+        right_angle_score = 0.0
+        for angle in angles:
+            if 85 < angle < 95:
+                right_angle_score += 0.15
+            elif 80 < angle < 100:
+                right_angle_score += 0.1
+            elif 75 < angle < 105:
+                right_angle_score += 0.05
+        
+        base_quad_score += min(right_angle_score, 0.6)
+        
+        # 面积一致性
+        try:
+            approx_area = cv2.contourArea(approx)
+            area_ratio = min(area / approx_area, approx_area / area) if approx_area > 0 else 0
+            if area_ratio > 0.9:
+                base_quad_score += 0.2
+            elif area_ratio > 0.8:
+                base_quad_score += 0.1
+        except:
+            pass
+        
+        # 正方形特征分析
+        square_score = base_quad_score
+        
+        # 边长相似性
+        if side_lengths:
+            avg_length = np.mean(side_lengths)
+            length_variance = np.var(side_lengths) / (avg_length**2) if avg_length > 0 else 1
+            
+            if length_variance < 0.05:
+                square_score += 0.3
+            elif length_variance < 0.1:
+                square_score += 0.2
+            elif length_variance < 0.2:
+                square_score += 0.1
+        
+        # 宽高比
+        x, y, w, h = cv2.boundingRect(approx)
+        aspect_ratio = max(w, h) / min(w, h) if min(w, h) > 0 else 999
+        
+        if aspect_ratio < 1.1:
+            square_score += 0.2
+        elif aspect_ratio < 1.2:
+            square_score += 0.1
+        elif aspect_ratio < 1.3:
+            square_score += 0.05
+        
+        # 矩形特征分析
+        rect_score = base_quad_score
+        
+        # 对边相等性
+        if len(side_lengths) == 4:
+            opposite_pairs = [
+                (side_lengths[0], side_lengths[2]),
+                (side_lengths[1], side_lengths[3])
+            ]
+            
+            pair_similarity_score = 0.0
+            for pair in opposite_pairs:
+                ratio = min(pair) / max(pair) if max(pair) > 0 else 0
+                if ratio > 0.9:
+                    pair_similarity_score += 0.15
+                elif ratio > 0.8:
+                    pair_similarity_score += 0.1
+                elif ratio > 0.7:
+                    pair_similarity_score += 0.05
+            
+            rect_score += pair_similarity_score
+        
+        # 宽高比合理性（不要求接近1:1）
+        if 1.2 < aspect_ratio < 3.0:
+            rect_score += 0.1
+        elif aspect_ratio < 5.0:
+            rect_score += 0.05
+        
+        return min(square_score, 1.0), min(rect_score, 1.0)
+    
+    def is_square(self, approx):
+        """判断四边形是否为正方形 - 继承自shape_detection_measurement"""
+        if len(approx) != 4:
+            return False
+        
+        # 计算四条边的长度
+        side_lengths = []
+        for i in range(4):
+            p1 = approx[i][0]
+            p2 = approx[(i + 1) % 4][0]
+            length = np.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
+            side_lengths.append(length)
+        
+        print(f"        边长: {[round(x, 1) for x in side_lengths]}")
+        
+        # 检查边长是否相近
+        avg_length = np.mean(side_lengths)
+        length_variance = np.var(side_lengths) / (avg_length**2) if avg_length > 0 else 1
+        
+        print(f"        边长方差: {length_variance:.3f} (阈值=0.1)")
+        
+        if length_variance > 0.1:  # 边长差异太大
+            print(f"        边长差异太大，判断为矩形")
+            return False
+        
+        # 检查宽高比
+        x, y, w, h = cv2.boundingRect(approx)
+        aspect_ratio = max(w, h) / min(w, h) if min(w, h) > 0 else 999
+        
+        print(f"        宽高比: {aspect_ratio:.3f} (阈值={1 + self.square_aspect_ratio_tolerance})")
+        
+        is_square_result = aspect_ratio <= (1 + self.square_aspect_ratio_tolerance)
+        
+        if is_square_result:
+            print(f"        判断结果: 正方形")
+        else:
+            print(f"        判断结果: 矩形")
+            
+        return is_square_result
+    
+    def calculate_shape_measurements(self, shape_info):
+        """计算形状的实际尺寸 - 继承自shape_detection_measurement"""
+        shape_type = shape_info['type']
+        contour = shape_info['contour']
+        area_px = shape_info['area']
+        perimeter_px = shape_info['perimeter']
+        
+        measurements = {
+            'shape_type': shape_type,
+            'area_mm2': round(area_px * (self.pixel_to_mm_ratio ** 2), 2),
+            'perimeter_mm': round(perimeter_px * self.pixel_to_mm_ratio, 2)
+        }
+        
+        if shape_type == 'circle':
+            # 方法1：用面积计算半径
+            radius_mm = math.sqrt(area_px * (self.pixel_to_mm_ratio ** 2) / math.pi)
+            diameter_mm = radius_mm * 2
+            
+            # 方法2：用最小外接圆
+            (cx, cy), radius_px = cv2.minEnclosingCircle(contour)
+            radius_mm_alt = radius_px * self.pixel_to_mm_ratio
+            diameter_mm_alt = radius_mm_alt * 2
+            
+            # 取平均值
+            diameter_mm = (diameter_mm + diameter_mm_alt) / 2
+            
+            measurements.update({
+                'diameter_mm': round(diameter_mm, 2),
+                'radius_mm': round(diameter_mm / 2, 2),
+                'key_parameter': round(diameter_mm, 2),
+                'parameter_name': 'diameter',
+                'parameter_unit': 'mm'
+            })
+            
+        elif shape_type == 'triangle':
+            # 计算三条边的长度
+            approx = shape_info['approx']
+            side_lengths_mm = []
+            
+            for i in range(3):
+                p1 = approx[i][0]
+                p2 = approx[(i + 1) % 3][0]
+                length_px = np.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
+                length_mm = length_px * self.pixel_to_mm_ratio
+                side_lengths_mm.append(length_mm)
+            
+            avg_side_mm = np.mean(side_lengths_mm)
+            
+            measurements.update({
+                'side_lengths_mm': [round(x, 2) for x in side_lengths_mm],
+                'avg_side_length_mm': round(avg_side_mm, 2),
+                'max_side_mm': round(max(side_lengths_mm), 2),
+                'key_parameter': round(avg_side_mm, 2),
+                'parameter_name': 'avg_side_length',
+                'parameter_unit': 'mm'
+            })
+            
+        elif shape_type in ['square', 'rectangle']:
+            # 计算四条边的长度
+            approx = shape_info['approx']
+            side_lengths_mm = []
+            
+            for i in range(4):
+                p1 = approx[i][0]
+                p2 = approx[(i + 1) % 4][0]
+                length_px = np.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
+                length_mm = length_px * self.pixel_to_mm_ratio
+                side_lengths_mm.append(length_mm)
+            
+            if shape_type == 'square':
+                avg_side_mm = np.mean(side_lengths_mm)
+                measurements.update({
+                    'side_length_mm': round(avg_side_mm, 2),
+                    'side_lengths_mm': [round(x, 2) for x in side_lengths_mm],
+                    'key_parameter': round(avg_side_mm, 2),
+                    'parameter_name': 'side_length',
+                    'parameter_unit': 'mm'
+                })
+            else:
+                # 矩形：取两组对边的平均值
+                width_mm = (side_lengths_mm[0] + side_lengths_mm[2]) / 2
+                height_mm = (side_lengths_mm[1] + side_lengths_mm[3]) / 2
+                max_side_mm = max(width_mm, height_mm)
+                
+                measurements.update({
+                    'width_mm': round(width_mm, 2),
+                    'height_mm': round(height_mm, 2),
+                    'max_side_mm': round(max_side_mm, 2),
+                    'key_parameter': round(max_side_mm, 2),
+                    'parameter_name': 'max_side',
+                    'parameter_unit': 'mm'
+                })
+        
+        else:  # polygon
+            # 使用等效直径
+            equivalent_diameter_mm = 2 * math.sqrt(area_px * (self.pixel_to_mm_ratio ** 2) / math.pi)
+            measurements.update({
+                'equivalent_diameter_mm': round(equivalent_diameter_mm, 2),
+                'vertices': shape_info['vertices'],
+                'key_parameter': round(equivalent_diameter_mm, 2),
+                'parameter_name': 'equivalent_diameter',
+                'parameter_unit': 'mm'
+            })
+        
+        return measurements
+    
+    def init_serial_communication(self):
+        """初始化串口通信"""
+        try:
+            self.serial_conn = serial.Serial(
+                port=self.serial_port,
+                baudrate=self.serial_baudrate,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=1,
+                xonxoff=False,
+                rtscts=False,
+                dsrdtr=False
+            )
+            
+            # 清空缓冲区
+            self.serial_conn.flushInput()
+            self.serial_conn.flushOutput()
+            
+            print(f"串口连接成功: {self.serial_port} @ {self.serial_baudrate}bps")
+            return True
+            
+        except serial.SerialException as e:
+            print(f"串口连接失败: {e}")
+            return False
+        except Exception as e:
+            print(f"串口初始化错误: {e}")
+            return False
+    
+    def start_serial_communication(self):
+        """启动串口通信线程"""
+        if not self.init_serial_communication():
+            print("Warning: 串口通信初始化失败，将以无电流数据模式运行")
+            return False
+        
+        self.serial_running = True
+        self.serial_thread = threading.Thread(target=self._serial_read_thread, daemon=True)
+        self.serial_thread.start()
+        print("串口通信线程已启动")
+        return True
+    
+    def _serial_read_thread(self):
+        """串口数据读取线程"""
+        buffer = ""
+        
+        while self.serial_running:
+            try:
+                if self.serial_conn and self.serial_conn.is_open:
+                    if self.serial_conn.in_waiting > 0:
+                        # 读取数据
+                        raw_data = self.serial_conn.read(self.serial_conn.in_waiting)
+                        
+                        if raw_data:
+                            try:
+                                # 解码数据
+                                data_str = raw_data.decode('utf-8', errors='ignore')
+                                buffer += data_str
+                                
+                                # 按行处理
+                                while '\n' in buffer:
+                                    line, buffer = buffer.split('\n', 1)
+                                    line = line.strip().replace('\r', '')
+                                    
+                                    if line:
+                                        self._process_current_data(line)
+                            
+                            except Exception as e:
+                                print(f"数据解码错误: {e}")
+                    
+                    else:
+                        time.sleep(0.01)  # 短暂休眠
+                        
+            except serial.SerialException as e:
+                print(f"串口读取错误: {e}")
+                time.sleep(1)
+                
+            except Exception as e:
+                print(f"串口线程错误: {e}")
+                time.sleep(1)
+    
+    def _process_current_data(self, line):
+        """处理接收到的电流数据"""
+        try:
+            # 使用正则表达式提取数字
+            numbers = re.findall(r'[-+]?\d*\.?\d+', line)
+            
+            if numbers:
+                current = float(numbers[0])
+                timestamp = datetime.now()
+                
+                # 更新当前电流值
+                self.current_value = current
+                self.last_current_update = timestamp
+                
+                # 计算功耗
+                self.calculate_power()
+                
+                # 将数据放入队列（供其他功能使用）
+                try:
+                    self.current_data_queue.put_nowait({
+                        'timestamp': timestamp,
+                        'current': current,
+                        'raw_data': line
+                    })
+                except queue.Full:
+                    # 队列满时，移除最老的数据
+                    try:
+                        self.current_data_queue.get_nowait()
+                        self.current_data_queue.put_nowait({
+                            'timestamp': timestamp,
+                            'current': current,
+                            'raw_data': line
+                        })
+                    except queue.Empty:
+                        pass
+                        
+        except ValueError:
+            print(f"电流数据解析失败: {repr(line)}")
+        except Exception as e:
+            print(f"处理电流数据时出错: {e}")
+    
+    def calculate_power(self):
+        """计算实时功耗P和最大功耗Pmax"""
+        try:
+            # 计算当前功耗 P = Us * Is
+            self.current_power = self.voltage_us * self.current_value
+            
+            # 如果当前功耗大于最大功耗，则更新最大功耗
+            if self.current_power > self.max_power:
+                self.max_power = self.current_power
+            
+        except Exception as e:
+            print(f"功耗计算错误: {e}")
+    
+    def get_power_values(self):
+        """获取功耗数据"""
+        return {
+            'current_power': self.current_power,
+            'max_power': self.max_power,
+            'voltage': self.voltage_us,
+            'current': self.current_value
+        }
+    
+    def get_current_value(self):
+        """获取最新的电流值"""
+        return self.current_value
+    
+    def is_current_data_fresh(self, max_age_seconds=2):
+        """检查电流数据是否新鲜"""
+        if self.last_current_update is None:
+            return False
+        
+        age = (datetime.now() - self.last_current_update).total_seconds()
+        return age <= max_age_seconds
+    
+    def stop_serial_communication(self):
+        """停止串口通信"""
+        self.serial_running = False
+        
+        if self.serial_thread and self.serial_thread.is_alive():
+            self.serial_thread.join(timeout=2)
+        
+        if self.serial_conn and self.serial_conn.is_open:
+            self.serial_conn.close()
+            print("串口连接已关闭")
+
+    def perform_measurement(self, image):
+        """执行完整测量：检测A4纸 -> 计算距离D -> 检测形状 -> 计算参数x"""
+        # Step 1: Detect A4 paper
+        target = self.detect_a4_paper(image)
+        if not target:
+            return None, None, "No A4 paper detected", None, None, None
+        
+        # Step 2: Calculate distance D
+        distance_d = self.calculate_distance_d(target['contour'])
+        if distance_d is None:
+            return None, None, "Distance calculation failed", target, None, None
+        
+        # 应用距离平滑滤波
+        smoothed_distance = self.smooth_distance(distance_d)
+        
+        # Step 3: Perspective transform
+        try:
+            M, transform_points = self.get_perspective_transform(target['contour'])
+            warped_image = cv2.warpPerspective(image, M, (self.output_width, self.output_height))
+        except Exception as e:
+            return smoothed_distance, None, "Perspective transform failed", target, None, None
+        
+        # Step 4: Detect shape and calculate parameter x
+        shape_info, x_value, binary_processed = self.detect_shape_and_calculate_x(warped_image)
+        if x_value is None:
+            return smoothed_distance, None, "No shape detected", target, None, binary_processed
+        
+        # 保存状态用于绘制
+        self.last_target = target
+        self.last_shape_info = shape_info
+        
+        return smoothed_distance, x_value, f"{shape_info['type']}", target, shape_info, binary_processed
+    
+    def draw_interface(self, image, d_value, x_value, shape_type, status_message, target=None, shape_info=None):
+        """Draw user interface with contour visualization and current display"""
+        result = image.copy()
+        h, w = result.shape[:2]
+        
+        # Draw A4 paper contour if available
+        if target is not None:
+            # Draw A4 paper boundary in yellow
+            cv2.drawContours(result, [target['contour']], -1, (0, 255, 255), 3)
+            
+            # Draw A4 paper center
+            center = target['center']
+            cv2.circle(result, center, 8, (0, 255, 255), -1)
+            cv2.putText(result, "A4", (center[0] + 15, center[1]), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        
+        # Draw shape contour if available
+        if shape_info is not None:
+            # Map shape types to colors
+            color_map = {
+                'circle': (0, 255, 0),      # Green
+                'triangle': (0, 0, 255),    # Red
+                'square': (255, 0, 0),      # Blue
+                'rectangle': (255, 0, 255), # Magenta
+                'polygon': (0, 255, 255),   # Cyan
+            }
+            
+            shape_color = color_map.get(shape_info['type'], (255, 255, 255))
+            
+            # Note: Shape contour is in warped image coordinate system
+            # We would need the inverse transform to draw it on original image
+            # For now, just indicate shape detection success
+            if target is not None:
+                cv2.putText(result, f"Shape: {shape_info['type']}", 
+                           (target['center'][0] + 15, target['center'][1] + 20), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, shape_color, 2)
+        
+        # Draw semi-transparent background for UI elements
+        overlay = result.copy()
+        
+        # Status bar background (top) - 增加高度以容纳电流和功耗显示
+        cv2.rectangle(overlay, (0, 0), (w, 200), (0, 0, 0), -1)
+        
+        # Button area background (bottom)
+        button_y = h - self.button_height - self.button_margin
+        cv2.rectangle(overlay, (0, button_y), (w, h), (50, 50, 50), -1)
+        
+        # Apply transparency
+        alpha = 0.7
+        cv2.addWeighted(overlay, alpha, result, 1 - alpha, 0, result)
+        
+        # Display measurement results
+        if d_value is not None:
+            d_text = f"D = {d_value:.1f}mm"
+            cv2.putText(result, d_text, (20, 40), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+        else:
+            cv2.putText(result, "D = --", (20, 40), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.2, (128, 128, 128), 3)
+        
+        if x_value is not None:
+            x_text = f"x = {x_value}mm ({shape_type})"
+            cv2.putText(result, x_text, (20, 80), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3)
+        else:
+            cv2.putText(result, "x = --", (20, 80), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.2, (128, 128, 128), 3)
+        
+        # Display current value (Is)
+        current_color = (0, 255, 255)  # Cyan color for current
+        if self.is_current_data_fresh():
+            is_text = f"Is = {self.current_value:.2f}A"
+            current_color = (0, 255, 255)  # Fresh data - cyan
+        else:
+            is_text = f"Is = {self.current_value:.2f}A (Old)"
+            current_color = (128, 128, 128)  # Old data - gray
+        
+        cv2.putText(result, is_text, (20, 120), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 1.2, current_color, 3)
+        
+        # Display power values (P and Pmax)
+        power_color = (255, 100, 0)  # Orange color for power
+        if self.is_current_data_fresh():
+            p_text = f"P = {self.current_power:.3f}W"
+            pmax_text = f"Pmax = {self.max_power:.3f}W"
+            power_color = (255, 100, 0)  # Fresh data - orange
+        else:
+            p_text = f"P = {self.current_power:.3f}W (Old)"
+            pmax_text = f"Pmax = {self.max_power:.3f}W (Old)"
+            power_color = (128, 128, 128)  # Old data - gray
+        
+        cv2.putText(result, p_text, (20, 160), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 1.2, power_color, 3)
+        cv2.putText(result, pmax_text, (350, 160), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 1.2, power_color, 3)
+        
+        # Status information
+        if status_message:
+            # Convert Chinese status messages to English
+            english_status = self.translate_status(status_message)
+            cv2.putText(result, english_status, (w - 300, 40), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        # Display serial connection status
+        if self.serial_conn and self.serial_conn.is_open:
+            serial_status = "Serial: Connected"
+            serial_color = (0, 255, 0)  # Green
+        else:
+            serial_status = "Serial: Disconnected"
+            serial_color = (0, 0, 255)  # Red
+        
+        cv2.putText(result, serial_status, (w - 200, 80), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, serial_color, 2)
+        
+        # Button layout: Measure button (left) and Reset button (right)
+        button_w = 160
+        button_h = 40
+        button_spacing = 20
+        total_button_width = 2 * button_w + button_spacing
+        start_x = (w - total_button_width) // 2
+        
+        # Measurement button
+        measure_button_x = start_x
+        button_color = (0, 200, 0) if not self.measuring else (200, 200, 0)
+        button_text = "MEASURE" if not self.measuring else "MEASURING..."
+        
+        cv2.rectangle(result, (measure_button_x, button_y + 20), 
+                     (measure_button_x + button_w, button_y + 20 + button_h), button_color, -1)
+        cv2.rectangle(result, (measure_button_x, button_y + 20), 
+                     (measure_button_x + button_w, button_y + 20 + button_h), (255, 255, 255), 2)
+        
+        # Measure button text
+        text_size = cv2.getTextSize(button_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+        text_x = measure_button_x + (button_w - text_size[0]) // 2
+        text_y = button_y + 45
+        cv2.putText(result, button_text, (text_x, text_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        # Reset button
+        reset_button_x = start_x + button_w + button_spacing
+        reset_button_color = (200, 100, 0)  # Orange color for reset
+        reset_button_text = "RESET"
+        
+        cv2.rectangle(result, (reset_button_x, button_y + 20), 
+                     (reset_button_x + button_w, button_y + 20 + button_h), reset_button_color, -1)
+        cv2.rectangle(result, (reset_button_x, button_y + 20), 
+                     (reset_button_x + button_w, button_y + 20 + button_h), (255, 255, 255), 2)
+        
+        # Reset button text
+        text_size = cv2.getTextSize(reset_button_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+        text_x = reset_button_x + (button_w - text_size[0]) // 2
+        text_y = button_y + 45
+        cv2.putText(result, reset_button_text, (text_x, text_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        # Store button areas for click detection
+        self.measure_button_area = (measure_button_x, button_y + 20, button_w, button_h)
+        self.reset_button_area = (reset_button_x, button_y + 20, button_w, button_h)
+        
+        return result
+    
+    def translate_status(self, chinese_message):
+        """Translate Chinese status messages to English"""
+        translations = {
+            "准备就绪": "Ready",
+            "未检测到A4纸": "No A4 paper detected",
+            "距离计算失败": "Distance calculation failed", 
+            "透视变换失败": "Perspective transform failed",
+            "未检测到几何形状": "No shape detected",
+            "测量完成": "Measurement complete",
+            "triangle": "Triangle",
+            "square": "Square", 
+            "rectangle": "Rectangle",
+            "circle": "Circle",
+            "polygon": "Polygon"
+        }
+        
+        for chinese, english in translations.items():
+            if chinese in chinese_message:
+                return chinese_message.replace(chinese, english)
+        
+        return chinese_message
+    
+    def handle_mouse_click(self, event, x, y, flags, param):
+        """Handle mouse click (simulate touch)"""
+        if event == cv2.EVENT_LBUTTONDOWN:
+            # Check if measurement button was clicked
+            if hasattr(self, 'measure_button_area'):
+                bx, by, bw, bh = self.measure_button_area
+                if bx <= x <= bx + bw and by <= y <= by + bh:
+                    if not self.measuring:
+                        self.measuring = True
+                        self.measurement_complete = False
+                        print("开始测量...")
+            
+            # Check if reset button was clicked
+            if hasattr(self, 'reset_button_area'):
+                bx, by, bw, bh = self.reset_button_area
+                if bx <= x <= bx + bw and by <= y <= by + bh:
+                    self.reset_measurement_data()
+                    print("测量数据已复位")
+    
+    def reset_measurement_data(self):
+        """复位测量数据 - 清除D和x数据，保留电流数据"""
+        self.last_d = None
+        self.last_x = None
+        self.last_target = None
+        self.last_shape_info = None
+        self.measurement_complete = False
+        self.distance_history = []  # 清空距离历史记录
+        print("复位完成: D和x数据已清零，A4纸检测框已清除，电流数据继续显示")
+    
+    def init_camera(self):
+        """Initialize camera"""
+        cap = cv2.VideoCapture(0)
+        if cap.isOpened():
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.camera_width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.camera_height)
+        return cap
+    
+    def run(self):
+        """Run main program"""
+        print("=== Integrated Measurement System with Power Monitoring ===")
+        print("Touch-friendly interface for D and x parameter measurement")
+        print("D = Distance from camera to A4 paper (mm)")
+        print("x = Key parameter of geometric shape on A4 paper (mm)")
+        print("Is = Current from STC32G (A)")
+        print("P = Real-time power consumption (W), P = Us * Is, Us = 5V")
+        print("Pmax = Maximum power consumption since program start (W)")
+        print()
+        
+        # Initialize serial communication
+        serial_success = self.start_serial_communication()
+        if serial_success:
+            print(f"串口通信已启动: {self.serial_port} @ {self.serial_baudrate}bps")
+        else:
+            print("Warning: 串口通信启动失败，系统将以无电流监测模式运行")
+        
+        # Initialize camera
+        cap = self.init_camera()
+        if not cap.isOpened():
+            print("Error: Cannot open camera")
+            # Cleanup serial if camera fails
+            if serial_success:
+                self.stop_serial_communication()
+            return
+        
+        # Create window and set mouse callback
+        cv2.namedWindow('Measurement System', cv2.WINDOW_NORMAL)
+        cv2.setWindowProperty('Measurement System', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        cv2.setMouseCallback('Measurement System', self.handle_mouse_click)
+        
+        print("Interface instructions:")
+        print("- Click 'MEASURE' button to start measurement")
+        print("- Click 'RESET' button to clear D and x data (keep current data)")
+        print("- D: Distance from camera to A4 paper")
+        print("- x: Key parameter of geometric shape")
+        print("- Is: Real-time current from STC32G (refreshed every 0.5s)")
+        print("- P: Real-time power consumption (P = Us * Is, Us = 5V)")
+        print("- Pmax: Maximum power consumption since program start")
+        print("- Press 'q' to exit program")
+        print("- Press 'r' to reset measurement data")
+        print("- Full screen mode enabled")
+        print()
+        
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            d_value = self.last_d
+            x_value = self.last_x
+            shape_type = ""
+            status_message = "Ready"
+            current_target = self.last_target
+            current_shape_info = self.last_shape_info
+            
+            # Perform measurement
+            if self.measuring and not self.measurement_complete:
+                measurement_result = self.perform_measurement(frame)
+                d_value, x_value, shape_type, target, shape_info, binary_processed = measurement_result
+                
+                if d_value is not None:
+                    self.last_d = d_value
+                    current_target = target
+                    
+                if x_value is not None:
+                    self.last_x = x_value
+                    current_shape_info = shape_info
+                    status_message = f"Measurement complete: {shape_type}"
+                    self.measurement_complete = True
+                else:
+                    status_message = shape_type  # Error message
+                
+                self.measuring = False
+            
+            # Draw interface with contours
+            display_image = self.draw_interface(frame, d_value, x_value, shape_type, status_message, 
+                                              current_target, current_shape_info)
+            
+            # Display
+            cv2.imshow('Measurement System', display_image)
+            
+            # Handle keys
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord(' '):  # Space key can also trigger measurement
+                if not self.measuring:
+                    self.measuring = True
+                    self.measurement_complete = False
+            elif key == ord('r'):  # Reset
+                self.reset_measurement_data()
+        
+        # Cleanup
+        cap.release()
+        cv2.destroyAllWindows()
+        
+        # Stop serial communication
+        if serial_success:
+            self.stop_serial_communication()
+        
+        print("Program exit - All resources cleaned up")
+
+if __name__ == "__main__":
+    # 可以在这里配置串口参数
+    # 常见串口设备: '/dev/ttyUSB0', '/dev/ttyAMA0', '/dev/serial0'
+    SERIAL_PORT = '/dev/ttyUSB0'
+    SERIAL_BAUDRATE = 9600
+    
+    print(f"串口配置: {SERIAL_PORT} @ {SERIAL_BAUDRATE}bps")
+    print("如需修改串口配置，请编辑程序中的 SERIAL_PORT 和 SERIAL_BAUDRATE 变量")
+    print()
+    
+    system = IntegratedMeasurementSystem(
+        serial_port=SERIAL_PORT,
+        serial_baudrate=SERIAL_BAUDRATE
+    )
+    system.run()

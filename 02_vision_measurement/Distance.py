@@ -1,0 +1,499 @@
+import cv2
+import numpy as np
+from scipy.spatial import distance as dist
+import imutils
+import pytesseract
+import os
+
+# 解决树莓派上的Qt插件问题
+os.environ['QT_QPA_PLATFORM'] = 'xcb'
+
+class VisionMeasurementSystem:
+    def __init__(self, camera_matrix, dist_coeffs, camera_height):
+        """
+        初始化测量系统
+        :param camera_matrix: 相机内参矩阵
+        :param dist_coeffs: 畸变系数
+        :param camera_height: 相机高度（cm）
+        """
+        self.camera_matrix = camera_matrix
+        self.dist_coeffs = dist_coeffs
+        self.camera_height = camera_height
+        self.a4_width = 21.0  # A4纸宽度（cm）
+        self.a4_height = 29.7  # A4纸高度（cm）
+        
+    def preprocess_image(self, image):
+        """图像预处理"""
+        # 畸变校正
+        undistorted = cv2.undistort(image, self.camera_matrix, self.dist_coeffs)
+        
+        # 转换为HSV空间以便更好分割
+        hsv = cv2.cvtColor(undistorted, cv2.COLOR_BGR2HSV)
+        
+        # 定义黑色范围 (边框)
+        lower_black = np.array([0, 0, 0])
+        upper_black = np.array([180, 255, 50])
+        mask_black = cv2.inRange(hsv, lower_black, upper_black)
+        
+        # 形态学操作增强边框
+        kernel = np.ones((5, 5), np.uint8)
+        mask_black = cv2.morphologyEx(mask_black, cv2.MORPH_CLOSE, kernel)
+        mask_black = cv2.morphologyEx(mask_black, cv2.MORPH_OPEN, kernel)
+        
+        return undistorted, mask_black
+    
+    def find_a4_sheet(self, mask):
+        """检测A4纸轮廓"""
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
+        
+        for contour in contours:
+            # 轮廓近似 - 使用更大的近似精度来简化轮廓
+            peri = cv2.arcLength(contour, True)
+            # 尝试不同的近似精度
+            for epsilon_factor in [0.01, 0.02, 0.03, 0.04, 0.05]:
+                approx = cv2.approxPolyDP(contour, epsilon_factor * peri, True)
+                if len(approx) == 4:
+                    break
+            
+            # 如果是四边形
+            if len(approx) == 4:
+                # 对四个点进行排序 (左上, 右上, 右下, 左下)
+                pts = approx.reshape(4, 2)
+                rect = self.order_points(pts)
+                
+                # 计算宽高比
+                (tl, tr, br, bl) = rect
+                widthA = dist.euclidean(tl, tr)
+                widthB = dist.euclidean(bl, br)
+                heightA = dist.euclidean(tl, bl)
+                heightB = dist.euclidean(tr, br)
+                
+                max_width = max(int(widthA), int(widthB))
+                max_height = max(int(heightA), int(heightB))
+                
+                aspect_ratio = max_width / max_height
+                
+                # 检查是否是A4纸比例 (宽高比 ~0.707)
+                if 0.6 < aspect_ratio < 0.8:
+                    return rect, max_width, max_height
+        
+        # 如果没找到标准A4纸，尝试更宽松的检测
+        print("Debug: 标准检测失败，尝试宽松检测...")
+        for contour in contours:
+            peri = cv2.arcLength(contour, True)
+            # 使用更大的近似精度强制简化为四边形
+            for epsilon_factor in [0.06, 0.08, 0.10, 0.12]:
+                approx = cv2.approxPolyDP(contour, epsilon_factor * peri, True)
+                if len(approx) == 4:
+                    pts = approx.reshape(4, 2)
+                    rect = self.order_points(pts)
+                    
+                    (tl, tr, br, bl) = rect
+                    widthA = dist.euclidean(tl, tr)
+                    widthB = dist.euclidean(bl, br)
+                    heightA = dist.euclidean(tl, bl)
+                    heightB = dist.euclidean(tr, br)
+                    
+                    max_width = max(int(widthA), int(widthB))
+                    max_height = max(int(heightA), int(heightB))
+                    aspect_ratio = max_width / max_height
+                    
+                    print(f"Debug: 宽松检测 - 宽高比={aspect_ratio:.3f}, ε={epsilon_factor}")
+                    
+                    # 更宽松的宽高比检查 (0.5-0.9)
+                    if 0.5 < aspect_ratio < 0.9:
+                        print("Debug: 宽松检测成功！")
+                        return rect, max_width, max_height
+                    break
+        
+        return None, None, None
+    
+    def order_points(self, pts):
+        """对四个点进行排序 (左上, 右上, 右下, 左下)"""
+        # 初始化坐标点
+        rect = np.zeros((4, 2), dtype="float32")
+        
+        # 左上点坐标和最小，右下点坐标和最大
+        s = pts.sum(axis=1)
+        rect[0] = pts[np.argmin(s)]
+        rect[2] = pts[np.argmax(s)]
+        
+        # 计算点之间的差值
+        diff = np.diff(pts, axis=1)
+        rect[1] = pts[np.argmin(diff)]
+        rect[3] = pts[np.argmax(diff)]
+        
+        return rect
+    
+    def calculate_distance(self, rect):
+        """计算目标物距离D"""
+        # 获取底边中点 (左下和右下点的中点)
+        (tl, tr, br, bl) = rect
+        bottom_center = ((bl[0] + br[0]) * 0.5, (bl[1] + br[1]) * 0.5)
+        
+        # 获取图像中心 (假设相机光轴与图像中心对齐)
+        image_center = (self.camera_matrix[0, 2], self.camera_matrix[1, 2])
+        
+        # 计算像素偏移
+        dy_pixels = bottom_center[1] - image_center[1]
+        
+        # 计算实际距离 (使用相似三角形原理)
+        fy = self.camera_matrix[1, 1]  # 焦距y方向
+        D = (self.camera_height * fy) / dy_pixels if dy_pixels != 0 else 0
+        
+        return abs(D)
+    
+    def perspective_transform(self, image, rect, output_size=(2100, 2970)):
+        """
+        透视变换获取A4纸正视图
+        :param output_size: 输出图像大小 (A4纸像素尺寸)
+        """
+        (tl, tr, br, bl) = rect
+        
+        # 设置目标点
+        dst = np.array([
+            [0, 0],
+            [output_size[0] - 1, 0],
+            [output_size[0] - 1, output_size[1] - 1],
+            [0, output_size[1] - 1]
+        ], dtype="float32")
+        
+        # 计算透视变换矩阵
+        M = cv2.getPerspectiveTransform(rect, dst)
+        
+        # 应用变换
+        warped = cv2.warpPerspective(image, M, output_size)
+        
+        return warped, M
+    
+    def detect_shapes(self, warped):
+        """在正视图上检测几何形状"""
+        # 转换为灰度图
+        gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+        
+        # 二值化
+        _, thresh = cv2.threshold(gray, 100, 255, cv2.THRESH_BINARY_INV)
+        
+        # 查找轮廓
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        shapes = []
+        for contour in contours:
+            # 忽略小轮廓
+            if cv2.contourArea(contour) < 100:
+                continue
+                
+            # 轮廓近似
+            peri = cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, 0.04 * peri, True)
+            
+            # 计算最小外接矩形
+            (x, y, w, h) = cv2.boundingRect(approx)
+            
+            # 计算中心点
+            M = cv2.moments(contour)
+            if M["m00"] != 0:
+                cX = int(M["m10"] / M["m00"])
+                cY = int(M["m01"] / M["m00"])
+            else:
+                cX, cY = 0, 0
+            
+            # 根据边数判断形状
+            shape = "unknown"
+            num_vertices = len(approx)
+            
+            if num_vertices == 3:
+                shape = "triangle"
+            elif num_vertices == 4:
+                # 计算宽高比
+                aspect_ratio = w / float(h)
+                shape = "square" if 0.9 <= aspect_ratio <= 1.1 else "rectangle"
+            else:
+                # 计算圆形度
+                area = cv2.contourArea(contour)
+                perimeter = cv2.arcLength(contour, True)
+                circularity = 4 * np.pi * area / (perimeter ** 2) if perimeter > 0 else 0
+                shape = "circle" if circularity > 0.8 else "unknown"
+            
+            shapes.append({
+                "shape": shape,
+                "contour": contour,
+                "bbox": (x, y, w, h),
+                "center": (cX, cY)
+            })
+        
+        return shapes
+    
+    def measure_size(self, shape, output_size):
+        """测量形状尺寸"""
+        # 计算像素到厘米的转换因子
+        px_per_cm_width = output_size[0] / self.a4_width
+        px_per_cm_height = output_size[1] / self.a4_height
+        px_per_cm = (px_per_cm_width + px_per_cm_height) / 2
+        
+        if shape["shape"] == "circle":
+            # 计算圆直径
+            area = cv2.contourArea(shape["contour"])
+            diameter_px = 2 * np.sqrt(area / np.pi)
+            diameter_cm = diameter_px / px_per_cm
+            return diameter_cm
+        else:
+            # 对于多边形，使用边界框尺寸
+            _, _, w, h = shape["bbox"]
+            size_px = max(w, h) if shape["shape"] == "square" else (w, h)
+            
+            if shape["shape"] == "square":
+                return size_px / px_per_cm
+            elif shape["shape"] == "triangle":
+                # 对于三角形，计算平均边长
+                peri = cv2.arcLength(shape["contour"], True)
+                side_length = peri / 3
+                return side_length / px_per_cm
+            else:
+                return w / px_per_cm, h / px_per_cm
+    
+    def detect_digits(self, warped, shape):
+        """在正方形内检测数字"""
+        x, y, w, h = shape["bbox"]
+        
+        # 提取ROI区域
+        roi = warped[y:y+h, x:x+w]
+        
+        # 预处理
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+        
+        # 使用Tesseract OCR识别数字
+        config = "--psm 10 --oem 3 -c tessedit_char_whitelist=0123456789"
+        digit = pytesseract.image_to_string(thresh, config=config)
+        
+        return digit.strip() if digit else None
+    
+    def find_min_area_square(self, shapes):
+        """寻找最小面积的正方形"""
+        squares = [s for s in shapes if s["shape"] == "square"]
+        if not squares:
+            return None
+        
+        # 按面积排序
+        squares.sort(key=lambda s: cv2.contourArea(s["contour"]))
+        return squares[0]
+    
+    def debug_analysis(self, image):
+        """完整的调试分析函数"""
+        print("=== 开始调试分析 ===")
+        
+        # 1. 图像基本信息
+        print(f"图像尺寸: {image.shape}")
+        print(f"图像类型: {image.dtype}")
+        
+        # 2. 预处理分析
+        undistorted, mask = self.preprocess_image(image)
+        
+        # 3. HSV分析
+        hsv = cv2.cvtColor(undistorted, cv2.COLOR_BGR2HSV)
+        h, s, v = cv2.split(hsv)
+        print(f"V通道统计: min={v.min()}, max={v.max()}, mean={v.mean():.1f}")
+        
+        # 4. 轮廓分析
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        print(f"检测到轮廓数量: {len(contours)}")
+        
+        # 分析前5个最大轮廓
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
+        for i, contour in enumerate(contours):
+            area = cv2.contourArea(contour)
+            peri = cv2.arcLength(contour, True)
+            
+            # 尝试不同的近似精度
+            best_approx = None
+            best_epsilon = None
+            for epsilon_factor in [0.01, 0.02, 0.03, 0.04, 0.05]:
+                approx = cv2.approxPolyDP(contour, epsilon_factor * peri, True)
+                if len(approx) == 4:
+                    best_approx = approx
+                    best_epsilon = epsilon_factor
+                    break
+                elif best_approx is None:
+                    best_approx = approx
+                    best_epsilon = epsilon_factor
+            
+            print(f"轮廓{i+1}: 面积={area:.0f}, 周长={peri:.0f}, 顶点数={len(best_approx)} (epsilon={best_epsilon})")
+            
+            if len(best_approx) == 4:
+                # 计算宽高比
+                pts = best_approx.reshape(4, 2)
+                rect = self.order_points(pts)
+                (tl, tr, br, bl) = rect
+                width = max(dist.euclidean(tl, tr), dist.euclidean(bl, br))
+                height = max(dist.euclidean(tl, bl), dist.euclidean(tr, br))
+                aspect_ratio = width / height
+                is_a4_ratio = 0.6 < aspect_ratio < 0.8
+                print(f"  -> 四边形宽高比: {aspect_ratio:.3f} {'[合格]' if is_a4_ratio else '[不合格]'}")
+                
+                # 显示具体的宽高值
+                print(f"     宽度: {width:.1f}px, 高度: {height:.1f}px")
+                if not is_a4_ratio:
+                    if aspect_ratio < 0.6:
+                        print("     问题: 宽高比过小 (纸张过窄或过高)")
+                    else:
+                        print("     问题: 宽高比过大 (纸张过宽或过矮)")
+            else:
+                print(f"  -> 无法简化为四边形 (最少顶点数: {len(best_approx)})")
+        
+        # 5. 可视化调试
+        debug_img = undistorted.copy()
+        cv2.drawContours(debug_img, contours, -1, (0, 255, 0), 2)
+        
+        return {
+            'undistorted': undistorted,
+            'mask': mask,
+            'contours': contours,
+            'debug_img': debug_img,
+            'hsv_stats': {'v_min': v.min(), 'v_max': v.max(), 'v_mean': v.mean()}
+        }
+    
+    def find_square_by_digit(self, shapes, target_digit):
+        """根据数字编号寻找正方形"""
+        for shape in shapes:
+            if shape["shape"] == "square":
+                digit = self.detect_digits(self.warped, shape)
+                if digit == target_digit:
+                    return shape
+        return None
+    
+    def measure(self, image, target_digit=None, debug=False):
+        """执行测量"""
+        # 1. 图像预处理
+        undistorted, mask = self.preprocess_image(image)
+        
+        if debug:
+            cv2.imshow("Preprocessed", undistorted)
+            cv2.imshow("Mask", mask)
+            cv2.waitKey(0)
+        
+        # 2. 检测A4纸
+        rect, width, height = self.find_a4_sheet(mask)
+        if rect is None:
+            if debug:
+                print("Debug: 未找到A4纸轮廓")
+                # 显示所有轮廓用于调试
+                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                debug_img = undistorted.copy()
+                cv2.drawContours(debug_img, contours, -1, (0, 255, 0), 2)
+                cv2.imshow("All Contours", debug_img)
+                cv2.waitKey(0)
+            return None, None, None
+        
+        # 3. 计算距离D
+        D = self.calculate_distance(rect)
+        
+        # 4. 透视变换
+        self.warped, M = self.perspective_transform(undistorted, rect)
+        
+        # 5. 检测形状
+        shapes = self.detect_shapes(self.warped)
+        
+        # 6. 测量尺寸
+        if not shapes:
+            return D, None, shapes
+        
+        # 根据要求选择目标形状
+        target_shape = None
+        
+        # 基本要求：测量中心形状
+        if target_digit is None:
+            # 寻找中心点最接近A4纸中心的形状
+            a4_center = (self.warped.shape[1] // 2, self.warped.shape[0] // 2)
+            min_dist = float('inf')
+            for shape in shapes:
+                dist = np.linalg.norm(np.array(shape["center"]) - np.array(a4_center))
+                if dist < min_dist:
+                    min_dist = dist
+                    target_shape = shape
+        
+        # 发挥部分：最小面积正方形或指定数字正方形
+        else:
+            if target_digit == "min":
+                target_shape = self.find_min_area_square(shapes)
+            else:
+                target_shape = self.find_square_by_digit(shapes, target_digit)
+        
+        # 测量目标尺寸
+        x = self.measure_size(target_shape, self.warped.shape[:2]) if target_shape else None
+        
+        return D, x, shapes
+
+    def visualize(self, image, D, x, shapes, target_shape=None):
+        """可视化结果"""
+        # 在原始图像上绘制A4纸轮廓
+        (tl, tr, br, bl) = self.rect
+        cv2.polylines(image, [np.array([tl, tr, br, bl], dtype=np.int32)], True, (0, 255, 0), 2)
+        
+        # 绘制底边中点
+        bottom_center = ((bl[0] + br[0]) * 0.5, (bl[1] + br[1]) * 0.5)
+        cv2.circle(image, (int(bottom_center[0]), int(bottom_center[1])), 5, (0, 0, 255), -1)
+        
+        # 显示距离
+        cv2.putText(image, f"D: {D:.1f}cm", (10, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        
+        # 在正视图中绘制形状
+        warped_display = self.warped.copy()
+        for shape in shapes:
+            color = (0, 255, 0) if shape == target_shape else (255, 0, 0)
+            cv2.drawContours(warped_display, [shape["contour"]], -1, color, 2)
+            
+            # 显示形状类型和尺寸
+            if shape == target_shape and x is not None:
+                text = f"{shape['shape']}: {x:.1f}cm"
+                cv2.putText(warped_display, text, (shape["center"][0], shape["center"][1]), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+        
+        return image, warped_display
+
+# 示例使用
+if __name__ == "__main__":
+    # 假设的相机参数 (实际使用中需要通过标定获取)
+    camera_matrix = np.array([
+        [1.06086502e+03,0.00000000e+00,6.44918938e+02],
+        [0.00000000e+00,1.07097676e+03,3.42131143e+02],
+        [0.00000000e+00,0.00000000e+00,1.00000000e+00]
+    ], dtype=np.float32)
+    
+    dist_coeffs = np.zeros((4, 1))  # 假设无畸变
+    camera_height = 50.0  # 相机高度50cm
+    
+    # 创建测量系统
+    vms = VisionMeasurementSystem(camera_matrix, dist_coeffs, camera_height)
+    
+    # 读取测试图像
+    image = cv2.imread("test_target.jpg")
+    
+    # 执行测量（带调试模式）
+    D, x, shapes = vms.measure(image, debug=True)
+    
+    if D is not None:
+        print(f"测量结果: D = {D:.1f}cm, x = {x:.1f}cm")
+        
+        # 可视化
+        orig_display, warped_display = vms.visualize(image, D, x, shapes)
+        
+        # 显示结果
+        cv2.imshow("Original Image", orig_display)
+        cv2.imshow("Warped View", warped_display)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+    else:
+        print("未检测到目标物，开始调试分析...")
+        # 运行调试分析
+        debug_info = vms.debug_analysis(image)
+        
+        # 显示调试图像
+        cv2.imshow("Debug - Undistorted", debug_info['undistorted'])
+        cv2.imshow("Debug - Mask", debug_info['mask'])
+        cv2.imshow("Debug - Contours", debug_info['debug_img'])
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
